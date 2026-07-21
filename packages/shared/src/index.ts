@@ -13,6 +13,33 @@ export const idParamsSchema = z.object({ id: z.coerce.number().int().positive() 
 export const pingParamsSchema = z.object({ name: z.string().trim().min(1).max(120) });
 export const pingQuerySchema = z.object({ state: z.enum(['start', 'success', 'fail']).optional() });
 export const pingBodySchema = z.union([z.string(), z.record(z.string(), z.unknown()), z.null(), z.undefined()]);
+export const dismissInputSchema = z.object({ reason: z.string().trim().min(1).max(1000) });
+
+export const diagnosisSchema = z.object({
+  root_cause: z.string().min(1),
+  evidence: z.array(z.object({
+    line: z.string().min(1),
+    why_it_matters: z.string().min(1)
+  })).min(1),
+  fix: z.object({
+    kind: z.enum(['patch', 'command', 'config']),
+    body: z.string().min(1),
+    explanation: z.string().min(1)
+  }),
+  risk: z.enum(['low', 'medium', 'high']),
+  confidence: z.number().min(0).max(1)
+});
+
+export const skepticReviewSchema = z.object({
+  verified: z.boolean(),
+  verdict: z.string().min(1),
+  objection: z.string().nullable()
+});
+
+export const configFixSchema = z.object({
+  path: z.string().min(1),
+  content: z.string()
+});
 
 export const runInputSchema = z.object({
   name: z.string().trim().min(1),
@@ -35,6 +62,28 @@ export const runInputSchema = z.object({
 export type RunInput = z.infer<typeof runInputSchema>;
 export type JobState = z.infer<typeof jobStateSchema>;
 export type IncidentKind = z.infer<typeof incidentKindSchema>;
+export type Diagnosis = z.infer<typeof diagnosisSchema>;
+export type SkepticReview = z.infer<typeof skepticReviewSchema>;
+
+export interface ProposalRow {
+  id: number;
+  incident_id: number;
+  created_at: string;
+  model: string;
+  root_cause: string;
+  evidence_json: string;
+  evidence: Diagnosis['evidence'];
+  fix_kind: Diagnosis['fix']['kind'];
+  fix_body: string;
+  fix_explanation: string;
+  risk: Diagnosis['risk'];
+  confidence: number;
+  review_verdict: string | null;
+  review_verified: number | null;
+  applied_at: string | null;
+  apply_result: string | null;
+  dismiss_reason: string | null;
+}
 
 export interface IncidentRow {
   id: number;
@@ -44,6 +93,10 @@ export interface IncidentRow {
   closed_at: string | null;
   kind: IncidentKind;
   status: z.infer<typeof incidentStatusSchema>;
+}
+
+export interface IncidentDetail extends IncidentRow {
+  proposal: ProposalRow | null;
 }
 
 export interface JobCard {
@@ -82,7 +135,7 @@ export interface JobDetail extends JobCard {
     cost_usd: number | null;
     source: z.infer<typeof runSourceSchema>;
   }>;
-  incidents: IncidentRow[];
+  incidents: IncidentDetail[];
 }
 
 export function databasePath(): string {
@@ -147,7 +200,16 @@ export function openDatabase(path = databasePath()): Database.Database {
     CREATE UNIQUE INDEX IF NOT EXISTS incidents_one_active_per_job_idx
       ON incidents(job_id) WHERE status IN ('open', 'proposed');
   `);
+  ensureColumn(db, 'proposals', 'fix_explanation', "TEXT NOT NULL DEFAULT ''");
+  ensureColumn(db, 'proposals', 'review_verdict', 'TEXT');
+  ensureColumn(db, 'proposals', 'review_verified', 'INTEGER');
+  ensureColumn(db, 'proposals', 'dismiss_reason', 'TEXT');
   return db;
+}
+
+function ensureColumn(db: Database.Database, table: string, column: string, definition: string): void {
+  const columns = db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
+  if (!columns.some((candidate) => candidate.name === column)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
 }
 
 export function recordRun(db: Database.Database, raw: RunInput): number {
@@ -179,7 +241,7 @@ export function recordRun(db: Database.Database, raw: RunInput): number {
   const result = db.prepare(`
     INSERT INTO runs (job_id, started_at, ended_at, exit_code, duration_ms, log_tail, tokens_in, tokens_out, cost_usd, source)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(job.id, input.startedAt, input.endedAt, input.exitCode, input.durationMs, input.logTail,
+  `).run(job.id, input.startedAt, input.endedAt, input.exitCode, input.durationMs, redactSecrets(input.logTail),
     input.tokensIn ?? null, input.tokensOut ?? null, input.costUsd ?? null, input.source);
   return Number(result.lastInsertRowid);
 }
@@ -192,19 +254,24 @@ export function listJobCards(db: Database.Database, nowMs = Date.now()): JobCard
       (SELECT exit_code FROM runs WHERE job_id = j.id ORDER BY started_at DESC LIMIT 1) AS last_exit_code,
       (SELECT duration_ms FROM runs WHERE job_id = j.id ORDER BY started_at DESC LIMIT 1) AS last_duration_ms,
       (SELECT COUNT(*) FROM runs WHERE job_id = j.id) AS run_count,
+      (SELECT closed_at FROM incidents WHERE job_id = j.id AND status IN ('applied', 'dismissed') AND closed_at IS NOT NULL ORDER BY closed_at DESC LIMIT 1) AS last_resolution_at,
       (SELECT id FROM incidents WHERE job_id = j.id AND status IN ('open', 'proposed') ORDER BY opened_at DESC LIMIT 1) AS open_incident_id,
       (SELECT kind FROM incidents WHERE job_id = j.id AND status IN ('open', 'proposed') ORDER BY opened_at DESC LIMIT 1) AS open_incident_kind
     FROM jobs j WHERE j.archived = 0 ORDER BY j.name
-  `).all() as Array<Omit<JobCard, 'recent_durations' | 'state' | 'next_expected_at'> & { last_run_id: number | null }>;
+  `).all() as Array<Omit<JobCard, 'recent_durations' | 'state' | 'next_expected_at'> & { last_run_id: number | null; last_resolution_at: string | null }>;
   const durations = db.prepare('SELECT duration_ms FROM runs WHERE job_id = ? ORDER BY started_at DESC LIMIT 12');
-  const exits = db.prepare('SELECT exit_code FROM runs WHERE job_id = ? ORDER BY started_at DESC LIMIT 5');
+  const exits = db.prepare(`
+    SELECT exit_code FROM runs
+    WHERE job_id = ? AND (? IS NULL OR started_at > ?)
+    ORDER BY started_at DESC LIMIT 5
+  `);
   return rows.map((row) => {
-    const recentExits = (exits.all(row.id) as { exit_code: number }[]).map((run) => run.exit_code);
+    const recentExits = (exits.all(row.id, row.last_resolution_at, row.last_resolution_at) as { exit_code: number }[]).map((run) => run.exit_code);
     const nextExpectedMs = row.last_run_at && row.expected_interval_s
       ? new Date(row.last_run_at).getTime() + row.expected_interval_s * 1000
       : null;
     const state = calculateJobState(row.last_run_at, row.last_exit_code, row.expected_interval_s, row.grace_s, recentExits, nowMs);
-    const { last_run_id: _lastRunId, ...card } = row;
+    const { last_run_id: _lastRunId, last_resolution_at: _lastResolutionAt, ...card } = row;
     return {
       ...card,
       state,
@@ -246,7 +313,9 @@ export function superviseDatabase(db: Database.Database, now = new Date()): Inci
           : job.state === 'flapping' ? 'flapping'
             : null;
       if (!kind || job.open_incident_id) continue;
-      const lastRun = db.prepare('SELECT id FROM runs WHERE job_id = ? ORDER BY started_at DESC LIMIT 1').get(job.id) as { id: number } | undefined;
+      const lastRun = kind === 'flapping'
+        ? db.prepare('SELECT id FROM runs WHERE job_id = ? AND exit_code != 0 ORDER BY started_at DESC LIMIT 1').get(job.id) as { id: number } | undefined
+        : db.prepare('SELECT id FROM runs WHERE job_id = ? ORDER BY started_at DESC LIMIT 1').get(job.id) as { id: number } | undefined;
       const result = db.prepare(`
         INSERT INTO incidents (job_id, run_id, opened_at, closed_at, kind, status)
         VALUES (?, ?, ?, NULL, ?, 'open')
@@ -262,7 +331,16 @@ export function getJobDetail(db: Database.Database, id: number): JobDetail | nul
   const card = listJobCards(db).find((job) => job.id === id);
   if (!card) return null;
   const runs = db.prepare('SELECT * FROM runs WHERE job_id = ? ORDER BY started_at DESC LIMIT 100').all(id) as JobDetail['runs'];
-  const incidents = db.prepare('SELECT * FROM incidents WHERE job_id = ? ORDER BY opened_at DESC').all(id) as IncidentRow[];
+  const incidentRows = db.prepare('SELECT * FROM incidents WHERE job_id = ? ORDER BY opened_at DESC').all(id) as IncidentRow[];
+  const proposalQuery = db.prepare('SELECT * FROM proposals WHERE incident_id = ? ORDER BY created_at DESC LIMIT 1');
+  const incidents = incidentRows.map((incident): IncidentDetail => {
+    const raw = proposalQuery.get(incident.id) as Omit<ProposalRow, 'evidence'> | undefined;
+    let evidence: Diagnosis['evidence'] = [];
+    if (raw) {
+      try { evidence = diagnosisSchema.shape.evidence.parse(JSON.parse(raw.evidence_json)); } catch { evidence = []; }
+    }
+    return { ...incident, proposal: raw ? { ...raw, evidence } : null };
+  });
   return { ...card, runs, incidents };
 }
 
@@ -278,7 +356,8 @@ export function upsertRemoteJob(db: Database.Database, name: string, now = new D
 export function redactSecrets(text: string): string {
   return text
     .replace(/sk-[A-Za-z0-9_-]{8,}/g, '[REDACTED]')
-    .replace(/\b(key|token|password)\s*[=:]\s*[^\s&]+/gi, '$1=[REDACTED]')
+    .replace(/\b(api[_-]?key|secret|key|token|password)\s*[=:]\s*[^\s&"']+/gi, '$1=[REDACTED]')
+    .replace(/(--(?:api[_-]?key|secret|key|token|password))\s+[^\s]+/gi, '$1 [REDACTED]')
     .replace(/\bBearer\s+[^\s]+/gi, 'Bearer [REDACTED]');
 }
 

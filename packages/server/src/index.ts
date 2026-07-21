@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { ZodError } from 'zod';
 import {
   getJobDetail,
+  dismissInputSchema,
   idParamsSchema,
   listJobCards,
   openDatabase,
@@ -20,6 +21,8 @@ import {
   upsertRemoteJob
 } from '@crontrol/shared';
 import { runChaos } from './supervision.js';
+import { ApprovalError, approveIncident, dismissIncident } from './approval.js';
+import { Sentinel } from './sentinel.js';
 
 export { runChaos } from './supervision.js';
 
@@ -33,6 +36,7 @@ export async function buildServer() {
   app.addContentTypeParser('application/x-www-form-urlencoded', { parseAs: 'string' }, (_request, body, done) => done(null, body));
   app.setErrorHandler((error, _request, reply) => {
     if (error instanceof ZodError) return reply.code(400).send({ error: 'Invalid request', issues: error.issues });
+    if (error instanceof ApprovalError) return reply.code(error.statusCode).send({ error: error.message });
     const message = error instanceof Error ? error.message : 'Internal server error';
     const status = message.startsWith('Demo jobs are missing') ? 404 : 500;
     return reply.code(status).send({ error: message });
@@ -42,13 +46,19 @@ export async function buildServer() {
     const payload = `event: ${event}\ndata: ${JSON.stringify({ at: new Date().toISOString() })}\n\n`;
     for (const client of clients) client.write(payload);
   };
+  const sentinel = new Sentinel(db, () => broadcast('proposal'));
+  const scheduleIncidents = (incidents: Array<{ id: number }>) => {
+    for (const incident of incidents) sentinel.schedule(incident.id);
+  };
   const supervise = () => {
     const opened = superviseDatabase(db);
+    scheduleIncidents(opened);
     broadcast(opened.length ? 'incident' : 'jobs');
     return opened;
   };
 
   superviseDatabase(db);
+  sentinel.schedulePending();
   const watchdog = setInterval(supervise, 30_000);
   watchdog.unref();
   app.addHook('onClose', async () => {
@@ -68,6 +78,7 @@ export async function buildServer() {
     const input = runInputSchema.parse(request.body);
     const runId = recordRun(db, { ...input, logTail: redactSecrets(input.logTail) });
     const incidents = superviseDatabase(db);
+    scheduleIncidents(incidents);
     broadcast(incidents.length ? 'incident' : 'run');
     return reply.code(201).send({ runId, incidents });
   });
@@ -98,6 +109,7 @@ export async function buildServer() {
       source: 'api'
     });
     const incidents = superviseDatabase(db);
+    scheduleIncidents(incidents);
     broadcast(incidents.length ? 'incident' : 'run');
     return reply.code(201).send({ name, state, runId, incidents });
   });
@@ -117,8 +129,26 @@ export async function buildServer() {
 
   app.post('/api/chaos', async (_request, reply) => {
     const result = await runChaos(db);
+    const incident = result.incident as { id: number } | undefined;
+    if (result.openedIncident && incident) sentinel.schedule(incident.id);
     broadcast('incident');
     return reply.code(201).send(result);
+  });
+
+  app.post('/api/incidents/:id/approve', async (request, reply) => {
+    const { id } = idParamsSchema.parse(request.params);
+    const result = await approveIncident(db, id);
+    if (!result.closed) sentinel.schedule(id);
+    broadcast(result.closed ? 'incident-closed' : 'run');
+    return reply.send(result);
+  });
+
+  app.post('/api/incidents/:id/dismiss', async (request, reply) => {
+    const { id } = idParamsSchema.parse(request.params);
+    const { reason } = dismissInputSchema.parse(request.body);
+    const result = dismissIncident(db, id, reason);
+    broadcast('incident-closed');
+    return reply.send(result);
   });
 
   const publicDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'public');

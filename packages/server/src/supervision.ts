@@ -21,6 +21,8 @@ export async function runChaos(db: Database.Database) {
   const expectedPath = join(job.cwd, 'agents', 'nightly-brief.sh');
   const renamedPath = join(job.cwd, 'agents', 'nightly_brief.sh');
   if (existsSync(expectedPath)) renameSync(expectedPath, renamedPath);
+  job.command = './agents/nightly-brief.sh';
+  db.prepare('UPDATE jobs SET command = ? WHERE id = ?').run(job.command, job.id);
 
   const started = new Date();
   const startedClock = performance.now();
@@ -45,12 +47,12 @@ export async function runChaos(db: Database.Database) {
     graceS: job.grace_s,
     startedAt: started.toISOString(),
     endedAt: ended.toISOString(),
-    exitCode: exitCode || 127,
+    exitCode,
     durationMs: Math.max(0, Math.round(performance.now() - startedClock)),
     logTail,
     source: 'demo'
   });
   const opened = superviseDatabase(db, ended);
   const incident = db.prepare("SELECT * FROM incidents WHERE job_id = ? AND status IN ('open', 'proposed') ORDER BY opened_at DESC LIMIT 1").get(job.id);
-  return { jobId: job.id, runId, exitCode: exitCode || 127, incident, openedIncident: opened.length > 0 };
+  return { jobId: job.id, runId, exitCode, incident, openedIncident: opened.length > 0 };
 }
