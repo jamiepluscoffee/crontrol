@@ -1,4 +1,7 @@
 import { openDatabase, recordRun } from '@crontrol/shared';
+import { existsSync, mkdirSync, renameSync, writeFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 
 type CrontrolDatabase = ReturnType<typeof openDatabase>;
 
@@ -11,7 +14,23 @@ const jobs = [
   { name: 'weekly-report-mailer', command: './agents/send-report.sh', description: 'Builds and emails the weekly operations report.', every: 604800, base: 74000, log: 'Rendered weekly report\nDelivered to 14 recipients\nMailer finished' }
 ] as const;
 
+export function demoRoot(): string {
+  return join(homedir(), '.crontrol', 'demo');
+}
+
+function prepareNightlyBriefScript(reset: boolean): void {
+  const agentsDir = join(demoRoot(), 'agents');
+  const expectedPath = join(agentsDir, 'nightly-brief.sh');
+  const renamedPath = join(agentsDir, 'nightly_brief.sh');
+  mkdirSync(agentsDir, { recursive: true });
+  if (reset && existsSync(renamedPath)) renameSync(renamedPath, expectedPath);
+  if (!existsSync(expectedPath) && !existsSync(renamedPath)) {
+    writeFileSync(expectedPath, '#!/bin/sh\necho "Fetched 38 sources"\necho "Generated 12-item morning brief"\necho "Brief saved successfully"\n', { mode: 0o755 });
+  }
+}
+
 export function seedDemo(db: CrontrolDatabase, reset: boolean): void {
+  prepareNightlyBriefScript(reset);
   const seed = db.transaction(() => {
     if (reset) {
       db.exec('DELETE FROM proposals; DELETE FROM incidents; DELETE FROM runs; DELETE FROM jobs;');
@@ -29,7 +48,7 @@ export function seedDemo(db: CrontrolDatabase, reset: boolean): void {
         recordRun(db, {
           name: job.name,
           command: job.command,
-          cwd: process.cwd(),
+          cwd: job.name === 'nightly-brief' ? demoRoot() : process.cwd(),
           description: job.description,
           expectedIntervalS: job.every,
           graceS: Math.round(job.every * 0.5),

@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 import { Command } from 'commander';
 import { spawn } from 'node:child_process';
-import { openDatabase, parseDuration, recordRun, redactSecrets } from '@crontrol/shared';
+import { openDatabase, parseDuration, recordRun, redactSecrets, type RunInput } from '@crontrol/shared';
 import { seedDemo } from './seed.js';
-import { startServer } from '@crontrol/server';
+import { runChaos, startServer } from '@crontrol/server';
 
 const program = new Command().name('ct').description('A local run ledger for unattended agents').version('0.1.0');
 
@@ -37,9 +37,7 @@ program.command('run')
     if (remainders.stdout) lines.push(remainders.stdout);
     if (remainders.stderr) lines.push(remainders.stderr);
     const ended = new Date();
-    const db = openDatabase();
-    try {
-      recordRun(db, {
+    const input: RunInput = {
         name: options.name,
         command: command.map(shellQuote).join(' '),
         cwd: process.cwd(),
@@ -52,8 +50,11 @@ program.command('run')
         durationMs: Math.max(0, Math.round(performance.now() - startedClock)),
         logTail: redactSecrets(lines.slice(-200).join('\n')),
         source: 'wrap'
-      });
-    } finally { db.close(); }
+      };
+    if (!await submitRun(input)) {
+      const db = openDatabase();
+      try { recordRun(db, input); } finally { db.close(); }
+    }
     process.exitCode = exitCode;
   });
 
@@ -75,6 +76,22 @@ program.command('up')
     console.log(`Crontrol is running at http://localhost:${port}`);
   });
 
+program.command('chaos')
+  .description('Break the seeded nightly briefing job and open an incident')
+  .option('--url <url>', 'running Crontrol server URL', process.env.CRONTROL_URL ?? 'http://127.0.0.1:4100')
+  .action(async (options: { url: string }) => {
+    let result: Awaited<ReturnType<typeof runChaos>>;
+    try {
+      const response = await fetch(`${options.url.replace(/\/$/, '')}/api/chaos`, { method: 'POST', signal: AbortSignal.timeout(1_000) });
+      if (!response.ok) throw new Error(`Server returned ${response.status}`);
+      result = await response.json() as Awaited<ReturnType<typeof runChaos>>;
+    } catch {
+      const db = openDatabase();
+      try { result = await runChaos(db); } finally { db.close(); }
+    }
+    console.log(`Chaos triggered: nightly-brief failed with exit ${result.exitCode}; incident is open.`);
+  });
+
 program.parseAsync().catch((error: unknown) => {
   console.error(error instanceof Error ? error.message : error);
   process.exitCode = 1;
@@ -82,4 +99,19 @@ program.parseAsync().catch((error: unknown) => {
 
 function shellQuote(value: string): string {
   return /^[A-Za-z0-9_./:@%+=,-]+$/.test(value) ? value : `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+async function submitRun(input: RunInput): Promise<boolean> {
+  const baseUrl = (process.env.CRONTROL_URL ?? 'http://127.0.0.1:4100').replace(/\/$/, '');
+  try {
+    const response = await fetch(`${baseUrl}/api/runs`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(input),
+      signal: AbortSignal.timeout(750)
+    });
+    return response.ok;
+  } catch {
+    return false;
+  }
 }
