@@ -8,3 +8,18 @@ export const snapshots = sqliteTable("snapshots", {
   label: text("label").notNull(),
   jobsJson: text("jobs_json").notNull(),
 });
+
+export const viewers = sqliteTable("viewers", {
+  email: text("email").primaryKey(),
+  addedBy: text("added_by").notNull(),
+  addedAt: text("added_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+  lastSeenAt: text("last_seen_at"),
+});
+
+export const accessAudit = sqliteTable("access_audit", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  actorEmail: text("actor_email").notNull(),
+  action: text("action").notNull(),
+  targetEmail: text("target_email").notNull(),
+  createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+});

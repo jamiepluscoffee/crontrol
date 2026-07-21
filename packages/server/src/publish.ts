@@ -133,6 +133,8 @@ export async function publishStatus(
   });
   if (!response.ok) throw new Error(`Private status publish failed (${response.status}).`);
   const stored = storedConfiguration(environment);
-  if (stored) writeStoredConfiguration({ ...stored, lastPublishedAt: snapshot.publishedAt }, environment);
+  if (stored && stored.siteUrl === base.origin && stored.publishToken === publishToken) {
+    writeStoredConfiguration({ ...stored, lastPublishedAt: snapshot.publishedAt }, environment);
+  }
   return { publishedAt: snapshot.publishedAt, jobs: snapshot.jobs.length, siteUrl: base.origin };
 }

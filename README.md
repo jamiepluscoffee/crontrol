@@ -2,7 +2,9 @@
 
 Your unattended agents, supervised, with failures diagnosed and fixed under human approval.
 
-Crontrol is a local-first run ledger and watchdog for cron jobs, headless AI agents, scrapers, backups, and scheduled pipelines. Prefix a job with `ct run` to record its outcome in SQLite; keep `ct up` running to detect failures, stale schedules, and flapping jobs. When something breaks, GPT-5.6 reads a redacted evidence bundle and proposes a reviewable fix—never an automatic one.
+Crontrol is a local-first run ledger and watchdog for cron jobs, headless AI agents, scrapers, backups, and scheduled pipelines. Prefix a job with `ct run` to record its outcome in SQLite; keep `ct up` running to detect failures, stale schedules, and flapping jobs. When something breaks, GPT-5.6 reads a redacted evidence bundle and proposes a reviewable fix, never an automatic one.
+
+Monitoring tells you your cron died. Crontrol reads the body, names the cause, and hands you the fix.
 
 ## 60-second quickstart
 
@@ -89,7 +91,13 @@ corepack pnpm exec ct publish --configure
 */5 * * * * cd /absolute/path/to/crontrol && corepack pnpm exec ct publish
 ```
 
-The hosted dashboard is read-only and protected by Sign in with ChatGPT for its owner. The Sites bypass token is used only for the machine-to-site publish request; keep both publishing tokens out of source control. This private status feature does not replace `OPENAI_API_KEY`: ChatGPT sign-in controls who can view the site, while sentinel diagnosis uses the separately billed OpenAI API.
+The hosted dashboard is read-only and protected by Sign in with ChatGPT plus Crontrol's owner/viewer membership check. The Sites bypass token is used only for the machine-to-site publish request; keep both publishing tokens out of source control. This private status feature does not replace `OPENAI_API_KEY`: ChatGPT sign-in establishes viewer identity, while sentinel diagnosis uses the separately billed OpenAI API.
+
+### Share view access
+
+M4.2 adds product-owned viewer permissions. The dashboard owner can select **Share dashboard**, add the email a teammate uses for ChatGPT, and send them the dashboard URL. After ChatGPT sign-in, every page and status API request checks that normalized email against the D1 membership list. Unknown accounts see no fleet data; viewers remain read-only and cannot publish, inspect logs, trigger chaos, or approve fixes. Owners can revoke access from the same panel, and membership changes are audit logged.
+
+`CRONTROL_OWNER_EMAIL` is configured in the Sites runtime during provisioning. It is not inferred from the first visitor, which prevents account-claim races.
 
 ## Fix semantics
 
@@ -149,6 +157,18 @@ npm --prefix packages/status run build
 
 The M3/M4 tests cover structured two-pass proposals, durable patch approval and green rerun, manual command semantics, dismissal, no-key behavior, redaction, child-environment isolation, remote-job refusal, mutation security, failed-fix feedback, and flapping resolution. M4.1 adds an allowlist test proving that publication excludes commands, paths, logs, evidence, proposals, and secrets.
 
+## Built with Codex and GPT-5.6
+
+This project was built from scratch during OpenAI Build Week, in a single Codex session, with GPT-5.6 as both the build partner and the product's core.
+
+**How the collaboration worked.** The product was specced in full before the first prompt (`SPEC.md` in this repo), with the 3-minute demo as the scope contract and five milestones sequenced so the project was submittable at the end of each. Codex built each milestone from the spec; bugs were reported back to Codex in plain language and it fixed its own code.
+
+**Two difficult moments materially improved the product.** First, an early command-level "fix" passed its immediate rerun but was not durable, because cron still invoked the original command; human review caught the integrity gap, and Codex reworked approval semantics so one-click fixes are reserved for durable file and configuration patches. Second, a repaired flapping job was immediately reopened because the watchdog's five-run window still contained pre-fix failures; together we traced this to the supervision model and changed incident resolution to reset the flapping baseline without deleting historical evidence.
+
+**Where the human made the calls:** product scope, the milestone order, the never-auto-apply security posture, the demo design, and the mid-build decision that mattered most: re-scoping M4 from polish to release-hardening after that durability review.
+
+**Where GPT-5.6 is the product, not just the builder.** The sentinel's two-pass diagnose-then-verify loop runs on `gpt-5.6-sol` with Structured Outputs; the model's name sits in the incident card footer because the diagnosis quality is the feature. In the final live chaos test, GPT-5.6 identified a missing POSIX-shell `fi` from the actual end-of-file error, used the earlier successful "Fetched 38 sources" output to localize the failure, and proposed only the necessary one-line patch at 99% confidence. Its skeptic pass verified the reasoning; approval applied the patch, reran the real job successfully, and closed the incident. The complete chaos-to-healthy loop took 49 seconds.
+
 ## What's next
 
 - Managed jobs through `ct execute`, making approved command changes durable
@@ -160,6 +180,7 @@ The M3/M4 tests cover structured two-pass proposals, durable patch approval and 
 - Cron-expression import and schedule awareness
 - Single-package npm distribution
 - Guided one-button Sites provisioning for installations running outside Codex
+- Optional invitation email delivery (M4.2 currently requires the owner to share the URL)
 - A managed Crontrol service for users who prefer account-based billing over their own OpenAI API project
 
 ## License
