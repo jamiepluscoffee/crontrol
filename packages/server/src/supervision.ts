@@ -1,8 +1,9 @@
 import type Database from 'better-sqlite3';
-import { existsSync, renameSync } from 'node:fs';
+import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { spawn } from 'node:child_process';
-import { recordRun, redactSecrets, superviseDatabase } from '@crontrol/shared';
+import { CORRUPTED_NIGHTLY_BRIEF_SCRIPT, recordRun, redactSecrets, superviseDatabase } from '@crontrol/shared';
+import { childProcessEnvironment } from './environment.js';
 
 interface ChaosJob {
   id: number;
@@ -19,15 +20,14 @@ export async function runChaos(db: Database.Database) {
   if (!job) throw new Error('Demo jobs are missing. Run `ct demo` first.');
 
   const expectedPath = join(job.cwd, 'agents', 'nightly-brief.sh');
-  const renamedPath = join(job.cwd, 'agents', 'nightly_brief.sh');
-  if (existsSync(expectedPath)) renameSync(expectedPath, renamedPath);
+  writeFileSync(expectedPath, CORRUPTED_NIGHTLY_BRIEF_SCRIPT, { mode: 0o755 });
   job.command = './agents/nightly-brief.sh';
   db.prepare('UPDATE jobs SET command = ? WHERE id = ?').run(job.command, job.id);
 
   const started = new Date();
   const startedClock = performance.now();
   const chunks: Buffer[] = [];
-  const child = spawn('/bin/sh', ['-c', job.command], { cwd: job.cwd, env: process.env, stdio: ['ignore', 'pipe', 'pipe'] });
+  const child = spawn('/bin/sh', ['-c', job.command], { cwd: job.cwd, env: childProcessEnvironment(), stdio: ['ignore', 'pipe', 'pipe'] });
   child.stdout?.on('data', (chunk: Buffer) => chunks.push(chunk));
   child.stderr?.on('data', (chunk: Buffer) => chunks.push(chunk));
   const exitCode = await new Promise<number>((resolve) => {
@@ -36,8 +36,8 @@ export async function runChaos(db: Database.Database) {
   });
   const ended = new Date();
   const rawLog = Buffer.concat(chunks).toString('utf8').trim()
-    || `/bin/sh: ${job.command}: command not found\nThe demo script was renamed to ./agents/nightly_brief.sh`;
-  const logTail = redactSecrets(`${rawLog}\nThe deployed script now exists at ./agents/nightly_brief.sh`).split(/\r?\n/).slice(-200).join('\n');
+    || `${job.command}: syntax error: unexpected end of file`;
+  const logTail = redactSecrets(`${rawLog}\nThe failing file is agents/nightly-brief.sh and its current contents are included in the incident context.`).split(/\r?\n/).slice(-200).join('\n');
   const runId = recordRun(db, {
     name: job.name,
     command: job.command,

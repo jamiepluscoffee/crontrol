@@ -1,6 +1,7 @@
 import Fastify from 'fastify';
 import fastifyStatic from '@fastify/static';
 import { existsSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
 import type { ServerResponse } from 'node:http';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -23,14 +24,27 @@ import {
 import { runChaos } from './supervision.js';
 import { ApprovalError, approveIncident, dismissIncident } from './approval.js';
 import { Sentinel } from './sentinel.js';
+import { publicationConfiguration, publishStatus } from './publish.js';
 
 export { runChaos } from './supervision.js';
+export { buildPublishedSnapshot, publicationConfiguration, publishStatus, savePublicationConfiguration } from './publish.js';
 
 export async function buildServer() {
   const app = Fastify({ logger: false });
   const db = openDatabase();
   const clients = new Set<ServerResponse>();
   const pingStarts = new Map<string, number>();
+  const sessionToken = randomBytes(32).toString('base64url');
+
+  app.addHook('onRequest', async (request, reply) => {
+    const host = request.headers.host ?? '';
+    if (!isLoopbackHost(host)) return reply.code(403).send({ error: 'Crontrol accepts only loopback Host headers.' });
+    const origin = request.headers.origin;
+    if (origin && !isSameOrigin(origin, host)) return reply.code(403).send({ error: 'Cross-origin requests are not allowed.' });
+    if (!['GET', 'HEAD', 'OPTIONS'].includes(request.method) && request.headers['x-crontrol-token'] !== sessionToken) {
+      return reply.code(403).send({ error: 'Missing or invalid Crontrol session token.' });
+    }
+  });
 
   app.addContentTypeParser('text/plain', { parseAs: 'string' }, (_request, body, done) => done(null, body));
   app.addContentTypeParser('application/x-www-form-urlencoded', { parseAs: 'string' }, (_request, body, done) => done(null, body));
@@ -68,6 +82,8 @@ export async function buildServer() {
   });
 
   app.get('/api/jobs', async () => ({ jobs: listJobCards(db) }));
+  app.get('/api/session', async () => ({ token: sessionToken }));
+  app.get('/api/remote-status', async () => publicationConfiguration());
   app.get('/api/jobs/:id', async (request, reply) => {
     const { id } = idParamsSchema.parse(request.params);
     const job = getJobDetail(db, id);
@@ -135,6 +151,11 @@ export async function buildServer() {
     return reply.code(201).send(result);
   });
 
+  app.post('/api/remote-status/publish', async (_request, reply) => {
+    const result = await publishStatus(db);
+    return reply.code(201).send(result);
+  });
+
   app.post('/api/incidents/:id/approve', async (request, reply) => {
     const { id } = idParamsSchema.parse(request.params);
     const result = await approveIncident(db, id);
@@ -167,4 +188,15 @@ export async function startServer(port = 4100) {
   const app = await buildServer();
   await app.listen({ port, host: '127.0.0.1' });
   return app;
+}
+
+function isLoopbackHost(value: string): boolean {
+  return /^(?:127\.0\.0\.1|localhost)(?::\d{1,5})?$/u.test(value);
+}
+
+function isSameOrigin(origin: string, host: string): boolean {
+  try {
+    const parsed = new URL(origin);
+    return parsed.protocol === 'http:' && parsed.host === host;
+  } catch { return false; }
 }

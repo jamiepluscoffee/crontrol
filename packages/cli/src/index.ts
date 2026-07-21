@@ -1,9 +1,11 @@
 #!/usr/bin/env node
+import 'dotenv/config';
 import { Command } from 'commander';
 import { spawn } from 'node:child_process';
+import OpenAI from 'openai';
 import { openDatabase, parseDuration, recordRun, redactSecrets, type RunInput } from '@crontrol/shared';
 import { seedDemo } from './seed.js';
-import { runChaos, startServer } from '@crontrol/server';
+import { publicationConfiguration, publishStatus, runChaos, savePublicationConfiguration, startServer } from '@crontrol/server';
 
 const program = new Command().name('ct').description('A local run ledger for unattended agents').version('0.1.0');
 
@@ -76,13 +78,54 @@ program.command('up')
     console.log(`Crontrol is running at http://localhost:${port}`);
   });
 
+program.command('doctor')
+  .description('Check OpenAI credentials and GPT-5.6 Sol access')
+  .action(async () => {
+    const apiKey = process.env.OPENAI_API_KEY;
+    if (!apiKey) {
+      console.error('✗ OPENAI_API_KEY is not set. Add it to a gitignored .env file or export it before running Crontrol.');
+      process.exitCode = 1;
+      return;
+    }
+    console.log('✓ OPENAI_API_KEY is present (value hidden)');
+    try {
+      const client = new OpenAI({ apiKey, timeout: 10_000, maxRetries: 0 });
+      const model = await client.models.retrieve('gpt-5.6-sol');
+      if (model.id !== 'gpt-5.6-sol') throw new Error(`Unexpected model response: ${model.id}`);
+      console.log('✓ gpt-5.6-sol is accessible');
+      console.log('Crontrol AI diagnosis is ready.');
+      const publishing = publicationConfiguration();
+      console.log(publishing.configured
+        ? '✓ Private status publishing is configured'
+        : 'ℹ Private status publishing is not configured (optional)');
+    } catch (error) {
+      console.error(`✗ Could not access gpt-5.6-sol: ${redactSecrets(error instanceof Error ? error.message : String(error))}`);
+      process.exitCode = 1;
+    }
+  });
+
+program.command('publish')
+  .description('Publish a sanitized snapshot to your private status site')
+  .option('--configure', 'securely save publishing values from the current environment')
+  .action(async (options: { configure?: boolean }) => {
+    if (options.configure) console.log(`Saved private status configuration to ${savePublicationConfiguration()}`);
+    const db = openDatabase();
+    try {
+      const result = await publishStatus(db);
+      console.log(`Published ${result.jobs} jobs to the private status site.`);
+      console.log(result.siteUrl);
+    } finally { db.close(); }
+  });
+
 program.command('chaos')
   .description('Break the seeded nightly briefing job and open an incident')
   .option('--url <url>', 'running Crontrol server URL', process.env.CRONTROL_URL ?? 'http://127.0.0.1:4100')
   .action(async (options: { url: string }) => {
     let result: Awaited<ReturnType<typeof runChaos>>;
     try {
-      const response = await fetch(`${options.url.replace(/\/$/, '')}/api/chaos`, { method: 'POST', signal: AbortSignal.timeout(1_000) });
+      const baseUrl = options.url.replace(/\/$/, '');
+      const token = await fetchSessionToken(baseUrl);
+      const response = await fetch(`${baseUrl}/api/chaos`, { method: 'POST', headers: { 'x-crontrol-token': token }, signal: AbortSignal.timeout(1_000) });
       if (!response.ok) throw new Error(`Server returned ${response.status}`);
       result = await response.json() as Awaited<ReturnType<typeof runChaos>>;
     } catch {
@@ -104,9 +147,10 @@ function shellQuote(value: string): string {
 async function submitRun(input: RunInput): Promise<boolean> {
   const baseUrl = (process.env.CRONTROL_URL ?? 'http://127.0.0.1:4100').replace(/\/$/, '');
   try {
+    const token = await fetchSessionToken(baseUrl);
     const response = await fetch(`${baseUrl}/api/runs`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', 'x-crontrol-token': token },
       body: JSON.stringify(input),
       signal: AbortSignal.timeout(750)
     });
@@ -114,4 +158,12 @@ async function submitRun(input: RunInput): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+async function fetchSessionToken(baseUrl: string): Promise<string> {
+  const response = await fetch(`${baseUrl}/api/session`, { signal: AbortSignal.timeout(750) });
+  if (!response.ok) throw new Error(`Could not establish a Crontrol session (${response.status}).`);
+  const body = await response.json() as { token?: string };
+  if (!body.token) throw new Error('Crontrol returned no session token.');
+  return body.token;
 }

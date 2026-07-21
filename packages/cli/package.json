@@ -8,6 +8,8 @@
   "dependencies": {
     "@crontrol/server": "workspace:*",
     "@crontrol/shared": "workspace:*",
-    "commander": "^14.0.0"
+    "commander": "^14.0.0",
+    "dotenv": "^17.2.3",
+    "openai": "^6.48.0"
   }
 }

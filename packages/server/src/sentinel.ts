@@ -1,6 +1,9 @@
 import type Database from 'better-sqlite3';
 import OpenAI from 'openai';
 import { zodTextFormat } from 'openai/helpers/zod';
+import { existsSync, readFileSync, realpathSync, statSync } from 'node:fs';
+import { relative, resolve, sep } from 'node:path';
+import { spawnSync } from 'node:child_process';
 import {
   diagnosisSchema,
   redactSecrets,
@@ -9,6 +12,7 @@ import {
   type IncidentRow,
   type SkepticReview
 } from '@crontrol/shared';
+import { childProcessEnvironment } from './environment.js';
 
 export interface IncidentContext {
   incident: IncidentRow;
@@ -24,6 +28,7 @@ export interface IncidentContext {
   failing_run: RunEvidence | null;
   last_successful_run: RunEvidence | null;
   command_diff: string | null;
+  related_files: Array<{ path: string; content: string }>;
   recent_runs: Array<{ exit_code: number; duration_ms: number; started_at: string }>;
 }
 
@@ -111,7 +116,11 @@ export class Sentinel {
     const context = buildIncidentContext(this.db, incidentId);
     if (!context) return;
     const contextJson = serializeIncidentContext(context);
-    const diagnosis = diagnosisSchema.parse(await this.model.diagnose(contextJson));
+    let diagnosis = diagnosisSchema.parse(await this.model.diagnose(contextJson));
+    if (diagnosis.fix.kind === 'patch') {
+      diagnosis = { ...diagnosis, fix: { ...diagnosis.fix, body: normalizeUnifiedDiff(diagnosis.fix.body) } };
+      validatePatch(context.job.cwd, diagnosis.fix.body);
+    }
     validateDiagnosisEvidence(context, diagnosis);
     validateSafeFix(diagnosis.fix.body);
     const review = skepticReviewSchema.parse(await this.model.review(contextJson, diagnosis));
@@ -183,8 +192,24 @@ export function buildIncidentContext(db: Database.Database, incidentId: number):
     failing_run: failingRun ?? null,
     last_successful_run: lastSuccess ?? null,
     command_diff: null,
+    related_files: collectRelatedFiles(job.cwd, job.command),
     recent_runs: recentRuns
   };
+}
+
+function collectRelatedFiles(cwd: string, command: string): Array<{ path: string; content: string }> {
+  const root = realpathSync(resolve(cwd));
+  const candidates = [...command.matchAll(/(?:^|\s)(\.{0,2}\/[A-Za-z0-9_./-]+)/gu)].map((match) => match[1]);
+  const files: Array<{ path: string; content: string }> = [];
+  for (const candidate of [...new Set(candidates)]) {
+    const absolute = resolve(root, candidate);
+    if (!existsSync(absolute)) continue;
+    const real = realpathSync(absolute);
+    if (real !== root && !real.startsWith(`${root}${sep}`)) continue;
+    if (!statSync(real).isFile() || statSync(real).size > 32_000) continue;
+    files.push({ path: relative(root, real), content: readFileSync(real, 'utf8') });
+  }
+  return files;
 }
 
 export function serializeIncidentContext(context: IncidentContext): string {
@@ -209,6 +234,36 @@ export function validateSafeFix(body: string): void {
   if (destructive.some((pattern) => pattern.test(body))) throw new Error('Unsafe or destructive proposed fix was rejected.');
 }
 
+export function normalizeUnifiedDiff(patch: string): string {
+  const lines = patch.replace(/\r\n/gu, '\n').split('\n');
+  for (let index = 0; index < lines.length; index += 1) {
+    const match = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@(.*)$/u.exec(lines[index]);
+    if (!match) continue;
+    let oldCount = 0;
+    let newCount = 0;
+    for (let cursor = index + 1; cursor < lines.length; cursor += 1) {
+      const line = lines[cursor];
+      if (line.startsWith('@@ ') || line.startsWith('diff --git ')) break;
+      if (line.startsWith('\\ No newline')) continue;
+      if (line.startsWith(' ') || line.startsWith('-')) oldCount += 1;
+      if (line.startsWith(' ') || line.startsWith('+')) newCount += 1;
+    }
+    lines[index] = `@@ -${match[1]},${oldCount} +${match[2]},${newCount} @@${match[3]}`;
+  }
+  return lines.join('\n');
+}
+
+function validatePatch(cwd: string, patch: string): void {
+  const result = spawnSync('git', ['apply', '--check', '-'], {
+    cwd,
+    env: childProcessEnvironment(),
+    input: patch,
+    encoding: 'utf8',
+    maxBuffer: 256_000
+  });
+  if (result.status !== 0) throw new Error(`GPT-5.6 proposed a patch that does not apply cleanly: ${redactSecrets(result.stderr || result.stdout)}`);
+}
+
 const DIAGNOSIS_PROMPT = `You are Crontrol's incident sentinel. Diagnose only from the supplied JSON evidence.
 Return the required structured object. The root cause must name the mechanism in one plain-language paragraph.
 Every evidence item must quote an exact complete line from one of the supplied log_tail fields.
@@ -218,6 +273,7 @@ Prefer the smallest fix that makes the job pass again.
 For fix.kind "command", fix.body must be the complete corrected job command that should replace the current job command.
 Never return a command fix identical to the current job.command; an unchanged command is not a fix.
 For fix.kind "patch", fix.body must be a unified diff suitable for git apply.
+Build patches only from related_files supplied in the context. Patch paths must be relative to job.cwd and use a/ and b/ prefixes.
 For fix.kind "config", fix.body must be JSON with exactly {"path":"relative/path","content":"complete replacement content"}.`;
 
 const REVIEW_PROMPT = `Act as a skeptical second-pass reviewer. Using only the supplied incident evidence and proposed diagnosis, decide whether the fix would work and what it could break.

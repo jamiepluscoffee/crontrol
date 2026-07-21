@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import {
+  CORRUPTED_NIGHTLY_BRIEF_SCRIPT,
   openDatabase,
   listJobCards,
   recordRun,
@@ -12,20 +13,45 @@ import {
   type SkepticReview
 } from '@crontrol/shared';
 import { approveIncident, dismissIncident } from './approval.js';
-import { buildIncidentContext, Sentinel, serializeIncidentContext, type SentinelModel } from './sentinel.js';
+import { childProcessEnvironment } from './environment.js';
+import { buildIncidentContext, normalizeUnifiedDiff, Sentinel, serializeIncidentContext, type SentinelModel } from './sentinel.js';
 import { runChaos } from './supervision.js';
+import { buildServer } from './index.js';
+import { buildPublishedSnapshot, publishStatus } from './publish.js';
 
-const failingLine = '/bin/sh: ./agents/nightly-brief.sh: No such file or directory';
+const failingLine = './agents/nightly-brief.sh: syntax error: unexpected end of file';
+const repairPatch = `diff --git a/agents/nightly-brief.sh b/agents/nightly-brief.sh
+--- a/agents/nightly-brief.sh
++++ b/agents/nightly-brief.sh
+@@ -3,4 +3,5 @@ set -eu
+ echo "Fetched 38 sources"
+ if [ "\${CRONTROL_BRIEF_MODE:-daily}" = "daily" ]; then
+ echo "Generated 12-item morning brief"
+ echo "Brief saved successfully"
++fi
+`;
+const ineffectivePatch = `diff --git a/agents/nightly-brief.sh b/agents/nightly-brief.sh
+--- a/agents/nightly-brief.sh
++++ b/agents/nightly-brief.sh
+@@ -1,6 +1,6 @@
+ #!/bin/sh
+ set -eu
+-echo "Fetched 38 sources"
++echo "Fetched 39 sources"
+ if [ "\${CRONTROL_BRIEF_MODE:-daily}" = "daily" ]; then
+ echo "Generated 12-item morning brief"
+ echo "Brief saved successfully"
+`;
 
 class FakeModel implements SentinelModel {
   async diagnose(): Promise<Diagnosis> {
     return {
-      root_cause: 'The deployed script was renamed, but the stored job command still points to the old hyphenated path.',
-      evidence: [{ line: failingLine, why_it_matters: 'The configured executable path does not exist.' }],
+      root_cause: 'The shell conditional in the nightly briefing script is missing its closing fi statement.',
+      evidence: [{ line: failingLine, why_it_matters: 'The shell reached end-of-file while parsing an incomplete conditional.' }],
       fix: {
-        kind: 'command',
-        body: './agents/nightly_brief.sh',
-        explanation: 'Point the job at the renamed script.'
+        kind: 'patch',
+        body: repairPatch,
+        explanation: 'Close the conditional in the actual script invoked by the job.'
       },
       risk: 'low',
       confidence: 0.98
@@ -33,21 +59,21 @@ class FakeModel implements SentinelModel {
   }
 
   async review(): Promise<SkepticReview> {
-    return { verified: true, verdict: 'The corrected path exists and is the smallest safe change.', objection: null };
+    return { verified: true, verdict: 'The patch adds the one missing shell terminator and changes no other behavior.', objection: null };
   }
 }
 
-class NoOpModel extends FakeModel {
+class CommandModel extends FakeModel {
   override async diagnose(): Promise<Diagnosis> {
     const diagnosis = await super.diagnose();
-    return { ...diagnosis, fix: { ...diagnosis.fix, body: './agents/nightly-brief.sh' } };
+    return { ...diagnosis, fix: { ...diagnosis.fix, kind: 'command', body: './agents/nightly-brief.sh --safe' } };
   }
 }
 
 class FailingFixModel extends FakeModel {
   override async diagnose(): Promise<Diagnosis> {
     const diagnosis = await super.diagnose();
-    return { ...diagnosis, fix: { ...diagnosis.fix, body: './agents/still-missing.sh' } };
+    return { ...diagnosis, fix: { ...diagnosis.fix, body: ineffectivePatch } };
   }
 }
 
@@ -69,12 +95,12 @@ test('M3 stores a two-pass proposal, applies it, reruns green, and closes the in
     const rerun = fixture.db.prepare('SELECT exit_code, log_tail FROM runs WHERE id = ?').get(result.runId) as { exit_code: number; log_tail: string };
     assert.equal(incident.status, 'applied');
     assert.ok(incident.closed_at);
-    assert.equal(job.command, './agents/nightly_brief.sh');
+    assert.equal(job.command, './agents/nightly-brief.sh');
     assert.equal(rerun.exit_code, 0);
     assert.match(rerun.log_tail, /Brief saved successfully/);
 
     const chaos = await runChaos(fixture.db);
-    assert.equal(chaos.exitCode, 127);
+    assert.notEqual(chaos.exitCode, 0);
     const rearmed = fixture.db.prepare("SELECT command FROM jobs WHERE name = 'nightly-brief'").get() as { command: string };
     assert.equal(rearmed.command, './agents/nightly-brief.sh');
   } finally { fixture.close(); }
@@ -121,25 +147,25 @@ test('M3 removes secret-looking strings before constructing an LLM request', () 
   } finally { fixture.close(); }
 });
 
-test('M3 rejects a no-op command proposal instead of rerunning the same failure', async () => {
+test('M4 keeps command proposals manual instead of pretending to update the scheduler', async () => {
   const fixture = createFixture();
   try {
-    const sentinel = new Sentinel(fixture.db, () => {}, new NoOpModel());
+    const sentinel = new Sentinel(fixture.db, () => {}, new CommandModel());
     await sentinel.diagnoseIncident(fixture.incidentId);
-    await assert.rejects(() => approveIncident(fixture.db, fixture.incidentId), /identical to the current command/);
+    await assert.rejects(() => approveIncident(fixture.db, fixture.incidentId), /manual application/);
     const runCount = fixture.db.prepare('SELECT COUNT(*) AS count FROM runs').get() as { count: number };
     assert.equal(runCount.count, 2);
   } finally { fixture.close(); }
 });
 
-test('M3 rolls back a failed command fix and permits diagnosis from the rerun evidence', async () => {
+test('M3 reopens a failed durable fix and permits diagnosis from the rerun evidence', async () => {
   const fixture = createFixture();
   try {
     const sentinel = new Sentinel(fixture.db, () => {}, new FailingFixModel());
     await sentinel.diagnoseIncident(fixture.incidentId);
     const result = await approveIncident(fixture.db, fixture.incidentId);
     assert.equal(result.closed, false);
-    assert.equal(result.exitCode, 127);
+    assert.notEqual(result.exitCode, 0);
     const incident = fixture.db.prepare('SELECT status, run_id FROM incidents WHERE id = ?').get(fixture.incidentId) as { status: string; run_id: number };
     const job = fixture.db.prepare("SELECT command FROM jobs WHERE name = 'nightly-brief'").get() as { command: string };
     assert.equal(incident.status, 'open');
@@ -154,7 +180,8 @@ test('M3 rolls back a failed command fix and permits diagnosis from the rerun ev
         const diagnosis = await new FakeModel().diagnose();
         return {
           ...diagnosis,
-          evidence: [{ line: newEvidenceLine, why_it_matters: 'The approved replacement command also points to a missing file.' }]
+          evidence: [{ line: newEvidenceLine, why_it_matters: 'The approved patch did not close the incomplete shell conditional.' }],
+          fix: { ...diagnosis.fix, body: repairPatch.replace('Fetched 38 sources', 'Fetched 39 sources') }
         };
       },
       async review() { return new FakeModel().review(); }
@@ -163,6 +190,58 @@ test('M3 rolls back a failed command fix and permits diagnosis from the rerun ev
     const revised = fixture.db.prepare('SELECT status FROM incidents WHERE id = ?').get(fixture.incidentId) as { status: string };
     assert.equal(revised.status, 'proposed');
   } finally { fixture.close(); }
+});
+
+test('M4 refuses local fix application for remote ping jobs', async () => {
+  const fixture = createFixture();
+  try {
+    const sentinel = new Sentinel(fixture.db, () => {}, new FakeModel());
+    await sentinel.diagnoseIncident(fixture.incidentId);
+    fixture.db.prepare("UPDATE jobs SET command = 'remote:nightly-brief' WHERE name = 'nightly-brief'").run();
+    await assert.rejects(() => approveIncident(fixture.db, fixture.incidentId), /diagnosis-only/);
+  } finally { fixture.close(); }
+});
+
+test('M4 strips credential-like variables from server-owned child environments', () => {
+  const result = childProcessEnvironment({
+    PATH: '/usr/bin', OPENAI_API_KEY: 'sk-test-secret', GITHUB_TOKEN: 'hidden',
+    SERVICE_VALUE: 'Bearer hidden-value', SAFE_SETTING: 'visible'
+  });
+  assert.deepEqual(result, { PATH: '/usr/bin', SAFE_SETTING: 'visible' });
+});
+
+test('M4 normalizes model-generated unified diff counts before validation', () => {
+  const malformed = repairPatch.replace('@@ -3,4 +3,5 @@', '@@ -3,3 +3,4 @@');
+  assert.match(normalizeUnifiedDiff(malformed), /@@ -3,4 \+3,5 @@/);
+});
+
+test('M4 rejects cross-origin and tokenless mutations', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'crontrol-security-test-'));
+  const previousPath = process.env.CRONTROL_DB;
+  process.env.CRONTROL_DB = join(root, 'crontrol.db');
+  const app = await buildServer();
+  try {
+    const session = await app.inject({ method: 'GET', url: '/api/session', headers: { host: 'localhost:4100' } });
+    assert.equal(session.statusCode, 200);
+    const token = session.json<{ token: string }>().token;
+    assert.ok(token.length >= 32);
+
+    const tokenless = await app.inject({ method: 'POST', url: '/api/chaos', headers: { host: 'localhost:4100' } });
+    assert.equal(tokenless.statusCode, 403);
+    const crossOrigin = await app.inject({
+      method: 'POST', url: '/api/chaos',
+      headers: { host: 'localhost:4100', origin: 'https://malicious.example', 'x-crontrol-token': token }
+    });
+    assert.equal(crossOrigin.statusCode, 403);
+    const authenticated = await app.inject({
+      method: 'POST', url: '/api/chaos', headers: { host: 'localhost:4100', 'x-crontrol-token': token }
+    });
+    assert.equal(authenticated.statusCode, 404);
+  } finally {
+    await app.close();
+    if (previousPath === undefined) delete process.env.CRONTROL_DB; else process.env.CRONTROL_DB = previousPath;
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test('M3 does not reopen a resolved flapping incident from pre-fix failures', () => {
@@ -200,11 +279,37 @@ test('M3 does not reopen a resolved flapping incident from pre-fix failures', ()
   }
 });
 
-function createFixture(failingLog = `${failingLine}\nThe deployed script now exists at ./agents/nightly_brief.sh`) {
+test('M4.1 publishes only the allowlisted read-only job snapshot', async () => {
+  const fixture = createFixture();
+  try {
+    const snapshot = buildPublishedSnapshot(fixture.db, 'Private fleet');
+    const serialized = JSON.stringify(snapshot);
+    assert.equal(snapshot.jobs.length, 1);
+    assert.equal(snapshot.jobs[0].name, 'nightly-brief');
+    assert.doesNotMatch(serialized, /command|cwd|log_tail|Brief saved successfully/);
+
+    let request: RequestInit | undefined;
+    const result = await publishStatus(fixture.db, {
+      CRONTROL_STATUS_URL: 'https://status.example.test',
+      CRONTROL_PUBLISH_TOKEN: 'publish-secret',
+      CRONTROL_SITES_TOKEN: 'sites-secret',
+      CRONTROL_PUBLISH_LABEL: 'Private fleet'
+    }, async (_input, init) => {
+      request = init;
+      return new Response(JSON.stringify({ ok: true }), { status: 201 });
+    });
+    assert.equal(result.jobs, 1);
+    const headers = new Headers(request?.headers);
+    assert.equal(headers.get('authorization'), 'Bearer publish-secret');
+    assert.equal(headers.get('oai-sites-authorization'), 'Bearer sites-secret');
+  } finally { fixture.close(); }
+});
+
+function createFixture(failingLog = `${failingLine}\nThe failing file is agents/nightly-brief.sh and its current contents are included in the incident context.`) {
   const root = mkdtempSync(join(tmpdir(), 'crontrol-m3-test-'));
   const agents = join(root, 'agents');
   mkdirSync(agents);
-  writeFileSync(join(agents, 'nightly_brief.sh'), '#!/bin/sh\necho "Brief saved successfully"\n', { mode: 0o755 });
+  writeFileSync(join(agents, 'nightly-brief.sh'), CORRUPTED_NIGHTLY_BRIEF_SCRIPT, { mode: 0o755 });
   const db = openDatabase(join(root, 'crontrol.db'));
   const now = Date.now();
   recordRun(db, {

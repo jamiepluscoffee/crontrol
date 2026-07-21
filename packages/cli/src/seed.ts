@@ -1,4 +1,4 @@
-import { openDatabase, recordRun } from '@crontrol/shared';
+import { NIGHTLY_BRIEF_SCRIPT, openDatabase, recordRun } from '@crontrol/shared';
 import { existsSync, mkdirSync, renameSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -24,9 +24,8 @@ function prepareDemoScripts(reset: boolean): void {
   const renamedPath = join(agentsDir, 'nightly_brief.sh');
   mkdirSync(agentsDir, { recursive: true });
   if (reset && existsSync(renamedPath)) renameSync(renamedPath, expectedPath);
-  if (!existsSync(expectedPath) && !existsSync(renamedPath)) {
-    writeFileSync(expectedPath, '#!/bin/sh\necho "Fetched 38 sources"\necho "Generated 12-item morning brief"\necho "Brief saved successfully"\n', { mode: 0o755 });
-  }
+  if (existsSync(renamedPath) && !existsSync(expectedPath)) renameSync(renamedPath, expectedPath);
+  writeFileSync(expectedPath, NIGHTLY_BRIEF_SCRIPT, { mode: 0o755 });
   const scriptsDir = join(demoRoot(), 'scripts');
   mkdirSync(scriptsDir, { recursive: true });
   writeFileSync(join(scriptsDir, 'check-links.mjs'), `const argument = process.argv.find((value) => value === '--retries' || value.startsWith('--retries='));

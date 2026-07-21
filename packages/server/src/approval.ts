@@ -10,6 +10,7 @@ import {
   type ProposalRow
 } from '@crontrol/shared';
 import { validateSafeFix } from './sentinel.js';
+import { childProcessEnvironment } from './environment.js';
 
 interface ApprovalJob {
   id: number;
@@ -36,11 +37,9 @@ export async function approveIncident(db: Database.Database, incidentId: number)
   if (!proposal) throw new ApprovalError(409, 'No GPT-5.6 proposal is available to approve.');
   const job = db.prepare('SELECT * FROM jobs WHERE id = ?').get(incident.job_id) as ApprovalJob | undefined;
   if (!job) throw new ApprovalError(404, 'Job not found.');
-  if (proposal.fix_kind === 'command' && proposal.fix_body.trim() === job.command.trim()) {
-    throw new ApprovalError(422, 'The proposed command is identical to the current command and cannot fix this incident. Dismiss it or wait for a revised diagnosis.');
-  }
+  if (job.command.startsWith('remote:')) throw new ApprovalError(409, 'Remote ping jobs are diagnosis-only; apply this fix on the system that owns the job.');
+  if (proposal.fix_kind === 'command') throw new ApprovalError(409, 'Command fixes require manual application because Crontrol does not own the scheduler definition.');
   validateSafeFix(proposal.fix_body);
-  const originalCommand = job.command;
 
   let fixResult: ProcessResult | null = null;
   try {
@@ -54,10 +53,6 @@ export async function approveIncident(db: Database.Database, incidentId: number)
       const destination = safeConfigPath(job.cwd, config.path);
       writeFileSync(destination, config.content, 'utf8');
       fixResult = syntheticResult(`Wrote ${config.path}`);
-    } else {
-      db.prepare('UPDATE jobs SET command = ? WHERE id = ?').run(proposal.fix_body, job.id);
-      job.command = proposal.fix_body;
-      fixResult = syntheticResult(`Updated job command to: ${proposal.fix_body}`);
     }
   } catch (error) {
     const message = redactSecrets(error instanceof Error ? error.message : String(error));
@@ -65,6 +60,7 @@ export async function approveIncident(db: Database.Database, incidentId: number)
       .run(new Date().toISOString(), JSON.stringify({ fix: { ok: false, output: message } }), proposal.id);
     throw new ApprovalError(422, message);
   }
+  if (!fixResult) throw new ApprovalError(422, 'No durable fix was applied.');
 
   const rerun = await spawnCapture('/bin/sh', ['-c', job.command], job.cwd);
   const runId = recordRun(db, {
@@ -91,7 +87,6 @@ export async function approveIncident(db: Database.Database, incidentId: number)
     if (rerun.exitCode === 0) {
       db.prepare("UPDATE incidents SET status = 'applied', closed_at = ? WHERE id = ?").run(now, incidentId);
     } else {
-      if (proposal.fix_kind === 'command') db.prepare('UPDATE jobs SET command = ? WHERE id = ?').run(originalCommand, job.id);
       db.prepare("UPDATE incidents SET status = 'open', run_id = ?, closed_at = NULL WHERE id = ?").run(runId, incidentId);
     }
   });
@@ -122,7 +117,7 @@ async function spawnCapture(command: string, args: string[], cwd: string, input?
   const startedAt = new Date();
   const startedClock = performance.now();
   const chunks: Buffer[] = [];
-  const child = spawn(command, args, { cwd, env: process.env, stdio: ['pipe', 'pipe', 'pipe'] });
+  const child = spawn(command, args, { cwd, env: childProcessEnvironment(), stdio: ['pipe', 'pipe', 'pipe'] });
   child.stdout?.on('data', (chunk: Buffer) => chunks.push(chunk));
   child.stderr?.on('data', (chunk: Buffer) => chunks.push(chunk));
   if (input === undefined) child.stdin?.end(); else child.stdin?.end(input);

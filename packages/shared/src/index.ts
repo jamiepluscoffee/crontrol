@@ -4,6 +4,21 @@ import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { z } from 'zod';
 
+export const NIGHTLY_BRIEF_SCRIPT = `#!/bin/sh
+set -eu
+echo "Fetched 38 sources"
+echo "Generated 12-item morning brief"
+echo "Brief saved successfully"
+`;
+
+export const CORRUPTED_NIGHTLY_BRIEF_SCRIPT = `#!/bin/sh
+set -eu
+echo "Fetched 38 sources"
+if [ "\${CRONTROL_BRIEF_MODE:-daily}" = "daily" ]; then
+echo "Generated 12-item morning brief"
+echo "Brief saved successfully"
+`;
+
 export const runSourceSchema = z.enum(['wrap', 'api', 'demo']);
 export const incidentKindSchema = z.enum(['failure', 'stale', 'flapping']);
 export const incidentStatusSchema = z.enum(['open', 'proposed', 'applied', 'dismissed']);
@@ -115,6 +130,7 @@ export interface JobCard {
   last_duration_ms: number | null;
   run_count: number;
   recent_durations: number[];
+  uptime_days: Array<{ date: string; state: 'ok' | 'failed' | 'empty' }>;
   state: JobState;
   next_expected_at: string | null;
   open_incident_id: number | null;
@@ -258,8 +274,9 @@ export function listJobCards(db: Database.Database, nowMs = Date.now()): JobCard
       (SELECT id FROM incidents WHERE job_id = j.id AND status IN ('open', 'proposed') ORDER BY opened_at DESC LIMIT 1) AS open_incident_id,
       (SELECT kind FROM incidents WHERE job_id = j.id AND status IN ('open', 'proposed') ORDER BY opened_at DESC LIMIT 1) AS open_incident_kind
     FROM jobs j WHERE j.archived = 0 ORDER BY j.name
-  `).all() as Array<Omit<JobCard, 'recent_durations' | 'state' | 'next_expected_at'> & { last_run_id: number | null; last_resolution_at: string | null }>;
+  `).all() as Array<Omit<JobCard, 'recent_durations' | 'uptime_days' | 'state' | 'next_expected_at'> & { last_run_id: number | null; last_resolution_at: string | null }>;
   const durations = db.prepare('SELECT duration_ms FROM runs WHERE job_id = ? ORDER BY started_at DESC LIMIT 12');
+  const uptimeRuns = db.prepare('SELECT started_at, exit_code FROM runs WHERE job_id = ? AND started_at >= ? ORDER BY started_at');
   const exits = db.prepare(`
     SELECT exit_code FROM runs
     WHERE job_id = ? AND (? IS NULL OR started_at > ?)
@@ -276,8 +293,21 @@ export function listJobCards(db: Database.Database, nowMs = Date.now()): JobCard
       ...card,
       state,
       next_expected_at: nextExpectedMs === null ? null : new Date(nextExpectedMs).toISOString(),
-      recent_durations: (durations.all(row.id) as { duration_ms: number }[]).map((run) => run.duration_ms).reverse()
+      recent_durations: (durations.all(row.id) as { duration_ms: number }[]).map((run) => run.duration_ms).reverse(),
+      uptime_days: buildUptimeDays(uptimeRuns.all(row.id, new Date(nowMs - 30 * 86400_000).toISOString()) as Array<{ started_at: string; exit_code: number }>, nowMs)
     };
+  });
+}
+
+function buildUptimeDays(runs: Array<{ started_at: string; exit_code: number }>, nowMs: number): JobCard['uptime_days'] {
+  const byDay = new Map<string, 'ok' | 'failed'>();
+  for (const run of runs) {
+    const day = run.started_at.slice(0, 10);
+    if (run.exit_code !== 0 || !byDay.has(day)) byDay.set(day, run.exit_code === 0 ? 'ok' : 'failed');
+  }
+  return Array.from({ length: 30 }, (_, index) => {
+    const date = new Date(nowMs - (29 - index) * 86400_000).toISOString().slice(0, 10);
+    return { date, state: byDay.get(date) ?? 'empty' };
   });
 }
 

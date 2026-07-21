@@ -3,10 +3,26 @@ import { createRoot } from 'react-dom/client';
 import type { IncidentDetail, JobCard, JobDetail, ProposalRow } from '@crontrol/shared';
 import './styles.css';
 
+let mutationToken = '';
+
+async function mutate(url: string, init: RequestInit = {}) {
+  if (!mutationToken) {
+    const session = await fetch('/api/session');
+    if (!session.ok) throw new Error(`Session request failed (${session.status})`);
+    mutationToken = ((await session.json()) as { token: string }).token;
+  }
+  const headers = new Headers(init.headers);
+  headers.set('x-crontrol-token', mutationToken);
+  return fetch(url, { ...init, method: init.method ?? 'POST', headers });
+}
+
 function App() {
   const [jobs, setJobs] = useState<JobCard[]>([]);
   const [error, setError] = useState('');
   const [chaosPending, setChaosPending] = useState(false);
+  const [publishPending, setPublishPending] = useState(false);
+  const [publishMessage, setPublishMessage] = useState('');
+  const [remoteStatus, setRemoteStatus] = useState<{ configured: boolean; siteUrl: string | null; published: boolean }>({ configured: false, siteUrl: null, published: false });
   const [selectedJobId, setSelectedJobId] = useState<number | null>(null);
   const [detail, setDetail] = useState<JobDetail | null>(null);
 
@@ -22,6 +38,7 @@ function App() {
 
   useEffect(() => {
     void loadJobs().catch((reason: Error) => setError(reason.message));
+    void fetch('/api/remote-status').then((response) => response.json() as Promise<typeof remoteStatus>).then(setRemoteStatus).catch(() => undefined);
     const events = new EventSource('/api/events');
     const refresh = () => {
       void loadJobs().catch((reason: Error) => setError(reason.message));
@@ -34,15 +51,27 @@ function App() {
 
   const healthy = jobs.filter((job) => job.state === 'healthy').length;
   const openIncidents = jobs.filter((job) => job.open_incident_id !== null).length;
+  const publishSucceeded = publishMessage.startsWith('Published');
   const triggerChaos = async () => {
     setChaosPending(true);
     try {
-      const response = await fetch('/api/chaos', { method: 'POST' });
+      const response = await mutate('/api/chaos');
       if (!response.ok) throw new Error(`Chaos failed (${response.status})`);
       await loadJobs();
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'Chaos failed');
     } finally { setChaosPending(false); }
+  };
+  const publishRemote = async () => {
+    setPublishPending(true); setPublishMessage('');
+    try {
+      const response = await mutate('/api/remote-status/publish');
+      const result = await response.json() as { error?: string; jobs?: number };
+      if (!response.ok) throw new Error(result.error ?? `Publish failed (${response.status})`);
+      setPublishMessage(`Published ${result.jobs ?? jobs.length} jobs ✓`);
+      setRemoteStatus((current) => ({ ...current, published: true }));
+    } catch (reason) { setPublishMessage(reason instanceof Error ? reason.message : 'Publish failed'); }
+    finally { setPublishPending(false); }
   };
   const openJob = (id: number) => {
     setSelectedJobId(id);
@@ -57,15 +86,29 @@ function App() {
   return <main>
     <header>
       <div><p className="eyebrow">CORNTROL YOUR CRONS</p><h1>Crontrol</h1></div>
-      <section className="status-box" aria-label="Fleet status">
-        <p className="status-label">STATUS</p>
-        <dl className="status-values">
-          <div><dt>Jobs</dt><dd>{jobs.length}</dd></div>
-          <div><dt>Healthy</dt><dd className="healthy-value">{healthy}</dd></div>
-          <div><dt>Needs attention</dt><dd className={openIncidents ? 'attention-value' : ''}>{openIncidents}</dd></div>
-        </dl>
-        <button className="chaos-button" disabled={chaosPending} onClick={() => void triggerChaos()}>{chaosPending ? 'Breaking…' : 'Trigger chaos'}</button>
-      </section>
+      <div className="header-panels">
+        <section className="status-box" aria-label="Fleet status">
+          <p className="status-label">STATUS</p>
+          <dl className="status-values">
+            <div><dt>Jobs</dt><dd>{jobs.length}</dd></div>
+            <div><dt>Healthy</dt><dd className="healthy-value">{healthy}</dd></div>
+            <div><dt>Needs attention</dt><dd className={openIncidents ? 'attention-value' : ''}>{openIncidents}</dd></div>
+          </dl>
+          <div className="status-actions">
+            <button className="chaos-button" disabled={chaosPending} onClick={() => void triggerChaos()}>{chaosPending ? 'Breaking…' : 'Trigger chaos'}</button>
+          </div>
+        </section>
+        {remoteStatus.configured && <section className="publish-box" aria-label="Private dashboard status">
+          <p className="status-label">DASHBOARD STATUS</p>
+          <div className={`dashboard-state ${remoteStatus.published || publishSucceeded ? 'is-published' : ''}`} role="status">
+            <strong>{remoteStatus.published || publishSucceeded ? 'Published' : 'Not published'}</strong>
+            {(remoteStatus.published || publishSucceeded) && <span>View only</span>}
+          </div>
+          <button className="publish-update" disabled={publishPending} onClick={() => void publishRemote()}>{publishPending ? 'Publishing…' : remoteStatus.published || publishSucceeded ? 'Publish update' : 'Publish dashboard'}</button>
+          {publishMessage && !publishSucceeded && <p className="publish-message error-message" role="status">{publishMessage}</p>}
+          {remoteStatus.siteUrl && <a className="remote-link" href={remoteStatus.siteUrl} target="_blank" rel="noreferrer">Open private dashboard ↗</a>}
+        </section>}
+      </div>
     </header>
     {error && <p className="error">{error}</p>}
     {!error && jobs.length === 0 && <p className="empty">No runs yet. Start with <code>ct demo</code>.</p>}
@@ -80,6 +123,7 @@ function JobCardView({ job, onOpen }: { job: JobCard; onOpen: () => void }) {
     <div className="card-head"><span className={`dot ${job.state}`} /><h2>{job.name}</h2><span className={`state ${job.state}-text`}>{job.state}</span></div>
     <p className="description">{job.description}</p>
     <div className="spark" aria-label="Recent run durations">{job.recent_durations.map((duration, index) => <i key={index} style={{ height: `${Math.max(12, duration / max * 100)}%` }} />)}</div>
+    <div className="uptime"><span>30D</span><div aria-label="Thirty-day run history">{job.uptime_days.map((day) => <i key={day.date} className={day.state} title={`${day.date}: ${day.state === 'empty' ? 'no run' : day.state}`} />)}</div></div>
     <dl><div><dt>LAST RUN</dt><dd>{job.last_run_at ? relativeTime(job.last_run_at) : 'never'}</dd></div><div><dt>DURATION</dt><dd>{formatDuration(job.last_duration_ms)}</dd></div><div><dt>RUNS</dt><dd>{job.run_count}</dd></div></dl>
     {job.open_incident_id && <p className="incident">INCIDENT #{job.open_incident_id} · {job.open_incident_kind}</p>}
     <code className="command">{job.command}</code>
@@ -115,8 +159,8 @@ function JobDrawer({ detail, onClose, onChanged }: { detail: JobDetail | null; o
 }
 
 function IncidentHistoryRow({ incident, onChanged }: { incident: IncidentDetail; onChanged: () => Promise<void> }) {
-  const [expanded, setExpanded] = useState(false);
   const active = incident.status === 'open' || incident.status === 'proposed';
+  const [expanded, setExpanded] = useState(active);
   return <div className={`incident-history-item ${active ? 'active' : ''}`}>
     <button className="incident-history-row" aria-expanded={expanded} onClick={() => setExpanded((value) => !value)}>
       <span className={active ? 'incident-active' : 'incident-resolved'}>{active ? 'ATTENTION' : 'RESOLVED'}</span>
@@ -133,12 +177,12 @@ function IncidentCard({ incident, onChanged }: { incident: IncidentDetail; onCha
   const [reason, setReason] = useState('');
   const [pending, setPending] = useState<'approve' | 'dismiss' | null>(null);
   const [actionError, setActionError] = useState('');
+  const [copied, setCopied] = useState(false);
   const act = async (action: 'approve' | 'dismiss') => {
     if (action === 'dismiss' && !reason.trim()) { setActionError('Enter a dismissal reason.'); return; }
     setPending(action); setActionError('');
     try {
-      const response = await fetch(`/api/incidents/${incident.id}/${action}`, {
-        method: 'POST',
+      const response = await mutate(`/api/incidents/${incident.id}/${action}`, {
         headers: action === 'dismiss' ? { 'content-type': 'application/json' } : undefined,
         body: action === 'dismiss' ? JSON.stringify({ reason }) : undefined
       });
@@ -148,14 +192,24 @@ function IncidentCard({ incident, onChanged }: { incident: IncidentDetail; onCha
     } catch (error) { setActionError(error instanceof Error ? error.message : `${action} failed`); }
     finally { setPending(null); }
   };
+  const copyCommand = async () => {
+    if (!proposal) return;
+    try {
+      await navigator.clipboard.writeText(proposal.fix_body);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1_500);
+    } catch { setActionError('Could not copy automatically. Select the command above and copy it manually.'); }
+  };
+  const actionable = proposal?.model === 'gpt-5.6' && !proposal.applied_at && (incident.status === 'proposed' || incident.status === 'open');
   return <article className="incident-card">
     <div className="incident-heading"><span>#{incident.id} · {incident.kind}</span><span className={`incident-status ${incident.status}`}>{incident.status}</span></div>
     <p className="timeline-line">Opened {new Date(incident.opened_at).toLocaleString()}</p>
     {!proposal && <p className="diagnosing">GPT-5.6 is reading the evidence…</p>}
     {proposal && <ProposalCard proposal={proposal} />}
     {proposal?.applied_at && incident.status === 'open' && <p className="diagnosing">The rerun still failed. The command was rolled back and GPT-5.6 is reviewing the new evidence…</p>}
-    {proposal?.model === 'gpt-5.6' && !proposal.applied_at && (incident.status === 'proposed' || incident.status === 'open') && <div className="actions">
-      <button className="approve" disabled={pending !== null} onClick={() => void act('approve')}>{pending === 'approve' ? 'Applying and rerunning…' : 'Approve fix'}</button>
+    {actionable && proposal.fix_kind === 'command' && <div className="manual-apply"><strong>MANUAL APPLY</strong><p>Crontrol does not own your scheduler definition. Copy this command, update the cron or service that launches the job, then let its next run report the result.</p><button onClick={() => void copyCommand()}>{copied ? 'Copied' : 'Copy command'}</button></div>}
+    {actionable && <div className="actions">
+      {proposal.fix_kind !== 'command' && <button className="approve" disabled={pending !== null} onClick={() => void act('approve')}>{pending === 'approve' ? 'Applying and rerunning…' : `Approve ${proposal.fix_kind}`}</button>}
       <div className="dismiss-row"><input value={reason} onChange={(event) => setReason(event.target.value)} placeholder="Reason for dismissal" /><button disabled={pending !== null} onClick={() => void act('dismiss')}>{pending === 'dismiss' ? 'Dismissing…' : 'Dismiss'}</button></div>
       {actionError && <p className="action-error">{actionError}</p>}
     </div>}
@@ -181,9 +235,18 @@ function ProposalCard({ proposal }: { proposal: ProposalRow }) {
 }
 
 function ApplyResult({ value }: { value: string }) {
-  let formatted = value;
-  try { formatted = JSON.stringify(JSON.parse(value), null, 2); } catch { /* stored legacy text */ }
-  return <><h4>Action result</h4><pre className="apply-result">{formatted}</pre></>;
+  let result: { fix?: { ok?: boolean }; rerun?: { runId?: number; exitCode?: number } } | null = null;
+  try { result = JSON.parse(value) as typeof result; } catch { /* stored legacy text */ }
+  const verified = result?.fix?.ok === true && result.rerun?.exitCode === 0;
+  return <div className={`resolution ${verified ? 'verified' : 'failed'}`} role="status">
+    <span className="resolution-mark" aria-hidden="true">{verified ? '✓' : '!'}</span>
+    <div>
+      <strong>{verified ? 'Fixed and verified' : 'Verification did not pass'}</strong>
+      <p>{verified
+        ? 'The approved fix was applied and the verification run completed successfully.'
+        : 'Crontrol kept this incident open so the new evidence can be reviewed safely.'}</p>
+    </div>
+  </div>;
 }
 
 function relativeTime(value: string) {

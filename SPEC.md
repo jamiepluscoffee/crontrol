@@ -21,9 +21,9 @@ The AI-native part is the point: the sentinel is powered by GPT-5.6 and is the p
 
 ## 2. The 3-minute demo (build to this)
 
-1. `npx crontrol init` then `ct demo`: dashboard opens with six realistic jobs and weeks of seeded history. (15s)
+1. Clone, `pnpm install && pnpm build`, then `pnpm exec ct demo`: dashboard opens with six realistic jobs and weeks of seeded history. (15s)
 2. Wrap a real cron in one line: `ct run --name nightly-brief --every 24h -- ./brief.sh`. Run it; watch the run appear live with duration, exit code, log tail. (30s)
-3. Press the demo's chaos button (or `ct chaos`): a job breaks with a realistic failure (missing binary on PATH after an env change). Card flips red. (15s)
+3. Press the demo's chaos button (or `ct chaos`): the contents of a script used by a demo cron are corrupted and its next run fails. Card flips red. (15s)
 4. The sentinel wakes automatically: GPT-5.6 reads the job definition, failing log, and last-good diff, and posts an incident: root cause in plain language, evidence lines cited, a proposed fix as a patch, risk level, confidence. (45s, the heart of the video)
 5. One click on Approve: the fix applies, the job reruns green, the incident closes with a timeline of what happened. (30s)
 6. Close on the fleet view: uptime bars, cost column for LLM jobs, "your agents, supervised." (15s)
@@ -44,7 +44,7 @@ crontrol/
 
 - **Storage:** SQLite via better-sqlite3, single file at `~/.crontrol/crontrol.db`. No external services. WAL mode so CLI writes and server reads never block each other.
 - **Processes:** one long-lived local server (`ct up`, default port 4100) owns the watchdog and sentinel. The CLI talks to it over HTTP when it is up and writes straight to SQLite when it is not, so `ct run` works standalone from any cron with zero daemon dependency.
-- **LLM:** OpenAI SDK, model `gpt-5.6`, Structured Outputs (JSON schema) for every sentinel call. API key from `OPENAI_API_KEY`; a missing key degrades gracefully (monitoring works, sentinel card shows "add a key to enable diagnosis").
+- **LLM:** OpenAI SDK, model `gpt-5.6`, Structured Outputs (JSON schema) for every sentinel call. API key from `OPENAI_API_KEY` (a gitignored project `.env` is supported for the clone-based quickstart); a missing key degrades gracefully. The key is used only by the server's OpenAI client and is stripped from every job child process.
 
 ## 4. Data model (SQLite)
 
@@ -70,8 +70,9 @@ proposals (id, incident_id, created_at, model, root_cause, evidence_json,
 - `ct run --name <n> [--every <dur>] -- <cmd...>`: the reporter. Spawns the command, captures exit code, duration, and a rolling 200-line log tail, writes the run, upserts the job (with `expected_interval_s` when `--every` is given). Redacts obvious secrets from the tail before storage (regexes for `sk-`, `key=`, `token=`, `Bearer`, `password`). Optional `--desc "<what this job is supposed to do>"` stores a one-line human statement of intent on the job (it feeds the sentinel), and `--grace <dur>` overrides the default grace window. This one command is the entire adoption story: prefix any crontab line with it.
 - `ct up` / `ct down`: start/stop the server + dashboard (prints the URL).
 - `ct status`: terminal fleet summary (name, last run, state, next expected).
+- `ct doctor`: confirms that `OPENAI_API_KEY` is present and that the configured account can access `gpt-5.6-sol`, without printing the secret.
 - `ct demo`: seeds six jobs with 2-3 weeks of plausible history (a nightly briefing agent, a scraper, a db backup, a model-eval batch, a link checker, a report mailer), including one flapping job and realistic log tails. Idempotent; `--reset` wipes and reseeds.
-- `ct chaos`: makes one seeded job fail on its next run in a realistic, diagnosable way (renames the script the job calls, so the log shows `command not found` and the fix is a path correction in the job's command). Exists so the demo video and any judge poking the repo can trigger the full incident loop on cue.
+- `ct chaos`: corrupts the contents of a seeded script so the next run fails with a realistic, diagnosable syntax error and GPT-5.6 can propose a durable patch to the actual file cron invokes. Exists so the demo video and any judge poking the repo can trigger the full incident loop on cue.
 
 ### 5.2 Watchdog (in server)
 
@@ -95,7 +96,7 @@ On incident open, build a context bundle: job row including its human-written `d
 
 System prompt requirements: reason only from the supplied evidence; if the evidence is insufficient, say so and propose the single most informative next diagnostic command instead of guessing; never propose destructive commands (rm, drop, force-push); prefer the smallest fix that makes the job pass again. A second GPT-5.6 call reviews the first proposal as a skeptic ("would this fix work given the evidence, and what could it break") and its verdict is stored and shown on the incident card as "verified by second pass" or the objection found. Two calls per incident, cheap, and it demos beautifully.
 
-**Approval gate, non-negotiable:** proposals are never auto-applied. The dashboard shows the full fix body; Approve executes it (patch via `git apply` in the job's cwd, command via spawn with output captured into the incident timeline, config via a shown-then-written file edit), then reruns the job once and records the outcome. Dismiss closes the incident with a reason field that is stored on the proposal row.
+**Approval gate, non-negotiable:** proposals are never auto-applied. The dashboard shows the full fix body. One-click Approve is available only for durable patch and config fixes; it applies the change, reruns the job once, and records the outcome. Command fixes are labeled "manual apply" and offered as copy-paste instructions because Crontrol does not yet own the user's scheduler definition. Remote-ping jobs are diagnosis-only and cannot apply local fixes. Dismiss closes the incident with a stored reason.
 
 ### 5.4 Dashboard (React + Vite + Tailwind)
 
@@ -103,25 +104,26 @@ Design language: dense, dark, calm; a NASA-flight-console feel without kitsch. G
 
 ### 5.5 API (Fastify)
 
-`GET /api/jobs`, `GET /api/jobs/:id` (runs + incidents), `POST /api/runs` (reporter ingest), `POST /api/ping/:name` (remote ingest, healthchecks.io-style, for jobs that can't be wrapped: CI steps, remote boxes, anything that can curl; optional `?state=start|success|fail` for duration tracking, request body stored as the log tail), `POST /api/incidents/:id/approve`, `POST /api/incidents/:id/dismiss`, `GET /api/events` (SSE stream), `POST /api/chaos` (demo only). Zod-validate everything at the boundary using the shared schemas.
+`GET /api/jobs`, `GET /api/jobs/:id` (runs + incidents), `GET /api/session` (per-boot mutation token), `POST /api/runs` (reporter ingest), `POST /api/ping/:name` (same-host or tunneled ingest for jobs that cannot be wrapped; optional `?state=start|success|fail`), `POST /api/incidents/:id/approve`, `POST /api/incidents/:id/dismiss`, `GET /api/events` (SSE), `POST /api/chaos` (demo only). Mutating dashboard requests require an expected loopback Host/Origin and the per-boot token. Keep the server bound to loopback and Zod-validate boundaries.
 
 ## 6. Milestones (submittable after each)
 
 - **M1, the spine (~4h):** shared schema + CLI `ct run` writing runs to SQLite + `ct demo` seed + minimal read-only dashboard showing cards from real data. Submittable as "run ledger for agents."
 - **M2, supervision (~3h):** server + watchdog + incidents + SSE live updates + `ct chaos` + the `/api/ping/:name` remote-ingest route. Cards go red on their own.
 - **M3, the sentinel (~5h):** GPT-5.6 diagnosis with structured output, incident cards with evidence + fix, the skeptic second pass, approve/dismiss executing fixes with the rerun loop. This is the product; protect these hours.
-- **M4, polish (~4h):** design pass to the flight-console standard, uptime bars, sparklines, mobile approve, README with 60-second quickstart, `npx` packaging.
-- **M5, stretch only if time remains:** cost column parsing (`CT_COST_USD` env or a `::ct-cost::0.12` log marker), Telegram/Slack webhook on incident open, `ct import-crontab` that suggests wrapped versions of existing crontab lines, cron-expression schedule awareness (parse the job's real crontab expression so expectations are exact times, not interval math), public per-job SVG status badges at hard-to-guess URLs for READMEs.
+- **M4, release hardening then polish (~half day):** (1) make patch/config fixes one-click and command fixes manual-only; change chaos to demonstrate a durable patch, (2) strip secret variables from child processes, (3) protect mutations with loopback Host/Origin checks plus a per-boot dashboard token and refuse local apply for remote jobs, (4) add `ct doctor`, then (5) complete the flight-console design pass, uptime bars, mobile approve, README, and a verified clone-to-dashboard quickstart.
+- **M4.1, private visibility:** add `ct publish` and a private, owner-only Sites dashboard. Publishing is explicit or scheduled by the user and sends only an allowlisted fleet snapshot (job identity/description, health, last-run metadata, incident kind, and 30-day uptime). It must never publish commands, working directories, logs, evidence, proposals, action results, or secrets. The hosted surface is read-only; all diagnosis and mutation remain loopback-only.
+- **Roadmap after submission:** managed jobs (`ct execute`), start/stop plus launchd/systemd persistence, rerun timeouts and patch rollback, proposal audit retention, webhook notifications, authenticated remote ping, cron-expression awareness/import, and single-package npm distribution.
 
 Cut from the bottom. M1-M3 plus a decent README beats M1-M5 half-finished.
 
 ## 7. Non-goals (resist these)
 
-No auth/multi-user, no cloud sync, no remote agents, no plugin system, no historical analytics beyond the 30-day bar, no auto-apply mode, no support for Windows task scheduler (document mac/linux cron + any shell loop).
+No multi-user administration, no hosted mutation, no remote agents, no plugin system, no historical analytics beyond the 30-day bar, no auto-apply mode, no support for Windows task scheduler (document mac/linux cron + any shell loop). M4.1's optional cloud component is a private, read-only snapshot rather than a synchronized control plane.
 
 ## 8. Submission checklist (from the hackathon rules)
 
-- Public repo, README with setup (target: clone to dashboard in under 2 minutes: `pnpm i && pnpm build && npx crontrol demo && npx crontrol up`).
+- Public repo, README with setup (target: clone to dashboard in under 2 minutes: `pnpm install && pnpm build && pnpm exec ct demo && pnpm exec ct up`).
 - Demo video under 3 minutes on YouTube following section 2, explicitly showing Codex building it and GPT-5.6 in the sentinel calls (show the model name in code and in the incident card footer: "diagnosed by gpt-5.6").
 - Codex session ID: keep all build sessions in Codex; the majority of core functionality must come from those sessions.
 - Category: Developer Tools. Project description: compress section 1 into 3 sentences; lead with "your unattended agents, supervised, with failures diagnosed and fixed under human approval."
@@ -131,6 +133,7 @@ No auth/multi-user, no cloud sync, no remote agents, no plugin system, no histor
 1. A crontab line prefixed with `ct run --name x --every 24h --` records runs with no daemon running.
 2. `ct demo && ct up` shows six populated cards within 60 seconds of clone on a clean machine with Node 20+.
 3. `ct chaos` produces, without human input: red card, open incident, GPT-5.6 proposal citing at least one real log line, within 30 seconds.
-4. Approving the chaos fix makes the job's next run pass and closes the incident, all visible live in the dashboard.
+4. Approving the chaos patch changes the actual script invoked by the job, makes the rerun pass, and closes the incident, all visible live in the dashboard. Command proposals are clearly manual-only.
 5. Sentinel with no API key set: dashboard still fully functional, incident card explains what is missing.
 6. No secret-looking string from a job's output ever appears in the DB or any LLM request (test with a seeded job that echoes a fake `sk-` key).
+7. `ct publish` sends only the documented allowlist to an owner-only Sites dashboard; the hosted dashboard cannot trigger chaos, approve/dismiss incidents, view logs, or mutate the local supervisor.
