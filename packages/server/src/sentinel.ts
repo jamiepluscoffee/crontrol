@@ -50,7 +50,7 @@ export class OpenAISentinelModel implements SentinelModel {
   private readonly client: OpenAI;
 
   constructor(apiKey: string) {
-    this.client = new OpenAI({ apiKey, timeout: 14_000, maxRetries: 0 });
+    this.client = new OpenAI({ apiKey, timeout: 60_000, maxRetries: 0 });
   }
 
   async diagnose(contextJson: string): Promise<Diagnosis> {
@@ -82,22 +82,31 @@ export class OpenAISentinelModel implements SentinelModel {
 
 export class Sentinel {
   private readonly inFlight = new Set<number>();
+  private readonly retry: Required<SentinelRetryOptions>;
 
   constructor(
     private readonly db: Database.Database,
-    private readonly onChange: () => void,
-    private readonly model: SentinelModel | null = process.env.OPENAI_API_KEY ? new OpenAISentinelModel(process.env.OPENAI_API_KEY) : null
-  ) {}
+    private readonly onChange: (incidentId: number) => void,
+    private readonly model: SentinelModel | null = process.env.OPENAI_API_KEY ? new OpenAISentinelModel(process.env.OPENAI_API_KEY) : null,
+    retry: SentinelRetryOptions = {}
+  ) {
+    this.retry = {
+      maxAttempts: retry.maxAttempts ?? 3,
+      backoffMs: retry.backoffMs ?? [1_000, 3_000],
+      sleep: retry.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)))
+    };
+  }
 
-  schedule(incidentId: number): void {
-    if (this.inFlight.has(incidentId)) return;
+  schedule(incidentId: number): boolean {
+    if (this.inFlight.has(incidentId)) return false;
     this.inFlight.add(incidentId);
-    void this.diagnoseIncident(incidentId)
+    void this.diagnoseWithRetry(incidentId)
       .catch((error: unknown) => this.storeUnavailable(incidentId, 'error', `Diagnosis could not complete: ${redactSecrets(error instanceof Error ? error.message : String(error))}`))
       .finally(() => {
         this.inFlight.delete(incidentId);
-        this.onChange();
+        this.onChange(incidentId);
       });
+    return true;
   }
 
   schedulePending(): void {
@@ -151,6 +160,19 @@ export class Sentinel {
     save();
   }
 
+  private async diagnoseWithRetry(incidentId: number): Promise<void> {
+    for (let attempt = 1; attempt <= this.retry.maxAttempts; attempt += 1) {
+      try {
+        await this.diagnoseIncident(incidentId);
+        return;
+      } catch (error) {
+        if (attempt >= this.retry.maxAttempts || !isRetryableDiagnosisError(error)) throw error;
+        const delay = this.retry.backoffMs[Math.min(attempt - 1, this.retry.backoffMs.length - 1)] ?? 0;
+        await this.retry.sleep(delay);
+      }
+    }
+  }
+
   private storeUnavailable(incidentId: number, model: 'unavailable' | 'error', message: string): void {
     const incident = this.db.prepare('SELECT id FROM incidents WHERE id = ?').get(incidentId);
     if (!incident) return;
@@ -164,6 +186,20 @@ export class Sentinel {
         'Configure the API key before starting the server.', 'low', 0, NULL, NULL, NULL, NULL, NULL)
     `).run(incidentId, new Date().toISOString(), model, message);
   }
+}
+
+export interface SentinelRetryOptions {
+  maxAttempts?: number;
+  backoffMs?: number[];
+  sleep?: (ms: number) => Promise<void>;
+}
+
+export function isRetryableDiagnosisError(error: unknown): boolean {
+  const candidate = error as { status?: number; code?: string; name?: string; message?: string };
+  if (candidate.status === 408 || candidate.status === 409 || candidate.status === 429 || (candidate.status ?? 0) >= 500) return true;
+  if (['ETIMEDOUT', 'ECONNRESET', 'ECONNREFUSED', 'EAI_AGAIN'].includes(candidate.code ?? '')) return true;
+  if (/timeout|timed out|connection|rate limit|temporar|overloaded/iu.test(`${candidate.name ?? ''} ${candidate.message ?? ''}`)) return true;
+  return false;
 }
 
 export function buildIncidentContext(db: Database.Database, incidentId: number): IncidentContext | null {

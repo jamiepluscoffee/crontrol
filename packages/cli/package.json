@@ -4,7 +4,7 @@
   "type": "module",
   "bin": { "ct": "dist/index.js", "crontrol": "dist/index.js" },
   "main": "dist/index.js",
-  "scripts": { "build": "tsc -p tsconfig.json" },
+  "scripts": { "build": "tsc -p tsconfig.json", "test": "node --test dist/discover.test.js" },
   "dependencies": {
     "@crontrol/server": "workspace:*",
     "@crontrol/shared": "workspace:*",

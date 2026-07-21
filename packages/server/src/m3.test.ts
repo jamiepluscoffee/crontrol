@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -12,7 +12,7 @@ import {
   type Diagnosis,
   type SkepticReview
 } from '@crontrol/shared';
-import { approveIncident, dismissIncident } from './approval.js';
+import { approveIncident, autoFixEligibility, dismissIncident } from './approval.js';
 import { childProcessEnvironment } from './environment.js';
 import { buildIncidentContext, normalizeUnifiedDiff, Sentinel, serializeIncidentContext, type SentinelModel } from './sentinel.js';
 import { runChaos } from './supervision.js';
@@ -77,6 +77,23 @@ class FailingFixModel extends FakeModel {
   }
 }
 
+class TimeoutThenSuccessModel extends FakeModel {
+  attempts = 0;
+  override async diagnose(): Promise<Diagnosis> {
+    this.attempts += 1;
+    if (this.attempts < 3) throw new Error('Request timed out.');
+    return super.diagnose();
+  }
+}
+
+class AlwaysTimeoutModel extends FakeModel {
+  attempts = 0;
+  override async diagnose(): Promise<Diagnosis> {
+    this.attempts += 1;
+    throw new Error('Request timed out.');
+  }
+}
+
 test('M3 stores a two-pass proposal, applies it, reruns green, and closes the incident', async () => {
   const fixture = createFixture();
   try {
@@ -106,6 +123,76 @@ test('M3 stores a two-pass proposal, applies it, reruns green, and closes the in
   } finally { fixture.close(); }
 });
 
+test('Auto fix accepts only a verified low-risk, high-confidence durable failure fix', async () => {
+  const fixture = createFixture();
+  try {
+    const sentinel = new Sentinel(fixture.db, () => {}, new FakeModel());
+    await sentinel.diagnoseIncident(fixture.incidentId);
+    assert.deepEqual(autoFixEligibility(fixture.db, fixture.incidentId), {
+      eligible: true,
+      reason: 'Low-risk, high-confidence durable fix verified by the skeptic pass.'
+    });
+    fixture.db.prepare('UPDATE proposals SET confidence = 0.94 WHERE incident_id = ?').run(fixture.incidentId);
+    assert.match(autoFixEligibility(fixture.db, fixture.incidentId).reason, /95% confidence/);
+    fixture.db.prepare('UPDATE proposals SET confidence = 0.98 WHERE incident_id = ?').run(fixture.incidentId);
+    const result = await approveIncident(fixture.db, fixture.incidentId, 'auto');
+    assert.equal(result.closed, true);
+    assert.equal(result.applyResult.appliedBy, 'auto');
+  } finally { fixture.close(); }
+});
+
+test('Auto fix refuses command proposals even when the model calls them low risk', async () => {
+  const fixture = createFixture();
+  try {
+    const sentinel = new Sentinel(fixture.db, () => {}, new CommandModel());
+    await sentinel.diagnoseIncident(fixture.incidentId);
+    const decision = autoFixEligibility(fixture.db, fixture.incidentId);
+    assert.equal(decision.eligible, false);
+    assert.match(decision.reason, /manual application/);
+  } finally { fixture.close(); }
+});
+
+test('Enabling Auto fix applies an already verified eligible proposal without approval', async () => {
+  const fixture = createFixture();
+  const previousPath = process.env.CRONTROL_DB;
+  let app: Awaited<ReturnType<typeof buildServer>> | undefined;
+  try {
+    await new Sentinel(fixture.db, () => {}, new FakeModel()).diagnoseIncident(fixture.incidentId);
+    process.env.CRONTROL_DB = fixture.dbPath;
+    app = await buildServer({ sentinelModel: null });
+    const session = await app.inject({ method: 'GET', url: '/api/session', headers: { host: 'localhost:4100' } });
+    const token = session.json<{ token: string }>().token;
+    const response = await app.inject({
+      method: 'POST', url: '/api/auto-fix',
+      headers: { host: 'localhost:4100', 'x-crontrol-token': token, 'content-type': 'application/json' },
+      payload: { enabled: true }
+    });
+    assert.equal(response.statusCode, 200);
+    await waitFor(() => {
+      const incident = fixture.db.prepare('SELECT status FROM incidents WHERE id = ?').get(fixture.incidentId) as { status: string };
+      return incident.status === 'applied';
+    });
+    const proposal = fixture.db.prepare('SELECT apply_result FROM proposals WHERE incident_id = ?').get(fixture.incidentId) as { apply_result: string };
+    assert.equal(JSON.parse(proposal.apply_result).appliedBy, 'auto');
+  } finally {
+    if (app) await app.close();
+    if (previousPath === undefined) delete process.env.CRONTROL_DB; else process.env.CRONTROL_DB = previousPath;
+    fixture.close();
+  }
+});
+
+test('A failed automatic verification rolls back the patch and stops automatic retries', async () => {
+  const fixture = createFixture();
+  try {
+    await new Sentinel(fixture.db, () => {}, new FailingFixModel()).diagnoseIncident(fixture.incidentId);
+    const result = await approveIncident(fixture.db, fixture.incidentId, 'auto');
+    assert.equal(result.closed, false);
+    assert.equal(result.applyResult.rollback.ok, true);
+    assert.match(readFileSync(join(fixture.root, 'agents', 'nightly-brief.sh'), 'utf8'), /Fetched 38 sources/);
+    assert.doesNotMatch(readFileSync(join(fixture.root, 'agents', 'nightly-brief.sh'), 'utf8'), /Fetched 39 sources/);
+  } finally { fixture.close(); }
+});
+
 test('M3 dismissal stores the reason and closes without applying', async () => {
   const fixture = createFixture();
   try {
@@ -132,6 +219,61 @@ test('M3 missing-key mode keeps monitoring usable and explains how to enable dia
     assert.match(proposal.root_cause, /OPENAI_API_KEY/);
     assert.equal(incident.status, 'open');
   } finally { fixture.close(); }
+});
+
+test('Sentinel retries transient diagnosis timeouts with bounded backoff', async () => {
+  const fixture = createFixture();
+  try {
+    const model = new TimeoutThenSuccessModel();
+    const delays: number[] = [];
+    await new Promise<void>((resolve) => {
+      const sentinel = new Sentinel(fixture.db, () => resolve(), model, {
+        maxAttempts: 3,
+        backoffMs: [1_000, 3_000],
+        sleep: async (ms) => { delays.push(ms); }
+      });
+      assert.equal(sentinel.schedule(fixture.incidentId), true);
+      assert.equal(sentinel.schedule(fixture.incidentId), false);
+    });
+    assert.equal(model.attempts, 3);
+    assert.deepEqual(delays, [1_000, 3_000]);
+    const proposal = fixture.db.prepare('SELECT model FROM proposals WHERE incident_id = ?').get(fixture.incidentId) as { model: string };
+    assert.equal(proposal.model, 'gpt-5.6');
+  } finally { fixture.close(); }
+});
+
+test('Retry diagnosis endpoint replaces a timed-out proposal with a fresh diagnosis', async () => {
+  const fixture = createFixture();
+  const previousPath = process.env.CRONTROL_DB;
+  let app: Awaited<ReturnType<typeof buildServer>> | undefined;
+  try {
+    await new Promise<void>((resolve) => {
+      new Sentinel(fixture.db, () => resolve(), new AlwaysTimeoutModel(), {
+        maxAttempts: 1,
+        sleep: async () => {}
+      }).schedule(fixture.incidentId);
+    });
+    const failed = fixture.db.prepare('SELECT model FROM proposals WHERE incident_id = ?').get(fixture.incidentId) as { model: string };
+    assert.equal(failed.model, 'error');
+
+    process.env.CRONTROL_DB = fixture.dbPath;
+    app = await buildServer({ sentinelModel: new FakeModel(), schedulePending: false });
+    const session = await app.inject({ method: 'GET', url: '/api/session', headers: { host: 'localhost:4100' } });
+    const token = session.json<{ token: string }>().token;
+    const response = await app.inject({
+      method: 'POST', url: `/api/incidents/${fixture.incidentId}/retry-diagnosis`,
+      headers: { host: 'localhost:4100', 'x-crontrol-token': token }
+    });
+    assert.equal(response.statusCode, 202);
+    await waitFor(() => {
+      const proposal = fixture.db.prepare('SELECT model FROM proposals WHERE incident_id = ? ORDER BY created_at DESC LIMIT 1').get(fixture.incidentId) as { model: string } | undefined;
+      return proposal?.model === 'gpt-5.6';
+    });
+  } finally {
+    if (app) await app.close();
+    if (previousPath === undefined) delete process.env.CRONTROL_DB; else process.env.CRONTROL_DB = previousPath;
+    fixture.close();
+  }
 });
 
 test('M3 removes secret-looking strings before constructing an LLM request', () => {
@@ -237,6 +379,15 @@ test('M4 rejects cross-origin and tokenless mutations', async () => {
       method: 'POST', url: '/api/chaos', headers: { host: 'localhost:4100', 'x-crontrol-token': token }
     });
     assert.equal(authenticated.statusCode, 404);
+    const initialAutoFix = await app.inject({ method: 'GET', url: '/api/auto-fix', headers: { host: 'localhost:4100' } });
+    assert.equal(initialAutoFix.json<{ enabled: boolean }>().enabled, false);
+    const enabledAutoFix = await app.inject({
+      method: 'POST', url: '/api/auto-fix',
+      headers: { host: 'localhost:4100', 'x-crontrol-token': token, 'content-type': 'application/json' },
+      payload: { enabled: true }
+    });
+    assert.equal(enabledAutoFix.statusCode, 200);
+    assert.equal(enabledAutoFix.json<{ enabled: boolean }>().enabled, true);
   } finally {
     await app.close();
     if (previousPath === undefined) delete process.env.CRONTROL_DB; else process.env.CRONTROL_DB = previousPath;
@@ -310,7 +461,8 @@ function createFixture(failingLog = `${failingLine}\nThe failing file is agents/
   const agents = join(root, 'agents');
   mkdirSync(agents);
   writeFileSync(join(agents, 'nightly-brief.sh'), CORRUPTED_NIGHTLY_BRIEF_SCRIPT, { mode: 0o755 });
-  const db = openDatabase(join(root, 'crontrol.db'));
+  const dbPath = join(root, 'crontrol.db');
+  const db = openDatabase(dbPath);
   const now = Date.now();
   recordRun(db, {
     name: 'nightly-brief', command: './agents/nightly-brief.sh', cwd: root,
@@ -329,7 +481,18 @@ function createFixture(failingLog = `${failingLine}\nThe failing file is agents/
   assert.equal(opened.run_id, failedRunId);
   return {
     db,
+    dbPath,
+    root,
     incidentId: opened.id,
     close: () => { db.close(); rmSync(root, { recursive: true, force: true }); }
   };
+}
+
+async function waitFor(predicate: () => boolean, timeoutMs = 2_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.fail('Timed out waiting for asynchronous auto fix.');
 }

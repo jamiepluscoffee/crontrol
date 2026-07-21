@@ -5,6 +5,7 @@ import { spawn } from 'node:child_process';
 import OpenAI from 'openai';
 import { openDatabase, parseDuration, recordRun, redactSecrets, type RunInput } from '@crontrol/shared';
 import { seedDemo } from './seed.js';
+import { discoverSchedules } from './discover.js';
 import { publicationConfiguration, publishStatus, runChaos, savePublicationConfiguration, startServer } from '@crontrol/server';
 
 const program = new Command().name('ct').description('A local run ledger for unattended agents').version('0.1.0');
@@ -102,6 +103,35 @@ program.command('doctor')
       console.error(`✗ Could not access gpt-5.6-sol: ${redactSecrets(error instanceof Error ? error.message : String(error))}`);
       process.exitCode = 1;
     }
+  });
+
+program.command('discover')
+  .description("Find the current user's scheduled jobs without changing them")
+  .option('--json', 'print machine-readable output for guided onboarding')
+  .action((options: { json?: boolean }) => {
+    const result = discoverSchedules();
+    if (options.json) {
+      console.log(JSON.stringify(result, null, 2));
+      return;
+    }
+    for (const warning of result.warnings) console.error(`! ${warning}`);
+    if (result.jobs.length === 0) {
+      console.log('No scheduled jobs found in the current user crontab or supported user schedulers.');
+      console.log('Nothing was changed.');
+      return;
+    }
+    const monitored = result.jobs.filter((job) => job.alreadyMonitored).length;
+    console.log(`Found ${result.jobs.length} scheduled ${result.jobs.length === 1 ? 'job' : 'jobs'} (read-only; nothing changed).`);
+    for (const [index, job] of result.jobs.entries()) {
+      console.log(`\n${index + 1}. ${job.label}`);
+      console.log(`   Source: ${job.source} · ${job.schedule}`);
+      console.log(`   Command: ${job.command}`);
+      console.log(`   Location: ${job.location}`);
+      if (job.alreadyMonitored) console.log('   Crontrol: already monitored');
+    }
+    const unmonitored = result.jobs.length - monitored;
+    console.log(`\n${monitored} already monitored · ${unmonitored} not monitored`);
+    if (unmonitored > 0) console.log('Ask Codex to assess the jobs you choose before wrapping them. It should show every schedule change for approval first.');
   });
 
 program.command('publish')

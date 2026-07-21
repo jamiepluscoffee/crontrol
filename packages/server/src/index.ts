@@ -7,6 +7,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ZodError } from 'zod';
 import {
+  autoFixInputSchema,
   getJobDetail,
   dismissInputSchema,
   idParamsSchema,
@@ -22,19 +23,22 @@ import {
   upsertRemoteJob
 } from '@crontrol/shared';
 import { runChaos } from './supervision.js';
-import { ApprovalError, approveIncident, dismissIncident } from './approval.js';
-import { Sentinel } from './sentinel.js';
+import { ApprovalError, approveIncident, autoFixEligibility, dismissIncident } from './approval.js';
+import { Sentinel, type SentinelModel } from './sentinel.js';
 import { publicationConfiguration, publishStatus } from './publish.js';
 
 export { runChaos } from './supervision.js';
 export { buildPublishedSnapshot, publicationConfiguration, publishStatus, savePublicationConfiguration } from './publish.js';
 
-export async function buildServer() {
+export async function buildServer(options: { sentinelModel?: SentinelModel | null; schedulePending?: boolean } = {}) {
   const app = Fastify({ logger: false });
   const db = openDatabase();
   const clients = new Set<ServerResponse>();
   const pingStarts = new Map<string, number>();
   const sessionToken = randomBytes(32).toString('base64url');
+  let autoFixEnabled = false;
+  const autoFixInFlight = new Set<number>();
+  const autoFixAttempted = new Set<number>();
 
   app.addHook('onRequest', async (request, reply) => {
     const host = request.headers.host ?? '';
@@ -60,7 +64,34 @@ export async function buildServer() {
     const payload = `event: ${event}\ndata: ${JSON.stringify({ at: new Date().toISOString() })}\n\n`;
     for (const client of clients) client.write(payload);
   };
-  const sentinel = new Sentinel(db, () => broadcast('proposal'));
+  let sentinel: Sentinel;
+  const maybeAutoFix = async (incidentId: number) => {
+    if (!autoFixEnabled || autoFixInFlight.has(incidentId) || autoFixAttempted.has(incidentId)) return;
+    const decision = autoFixEligibility(db, incidentId);
+    if (!decision.eligible) return;
+    autoFixInFlight.add(incidentId);
+    autoFixAttempted.add(incidentId);
+    broadcast('auto-fix');
+    try {
+      const result = await approveIncident(db, incidentId, 'auto');
+      if (!result.closed) sentinel.schedule(incidentId);
+      broadcast(result.closed ? 'incident-closed' : 'run');
+    } catch {
+      db.prepare("UPDATE incidents SET status = 'open' WHERE id = ? AND status = 'proposed'").run(incidentId);
+      sentinel.schedule(incidentId);
+      broadcast('proposal');
+    } finally {
+      autoFixInFlight.delete(incidentId);
+      broadcast('auto-fix');
+    }
+  };
+  const sentinelChanged = (incidentId: number) => {
+    broadcast('proposal');
+    void maybeAutoFix(incidentId);
+  };
+  sentinel = Object.prototype.hasOwnProperty.call(options, 'sentinelModel')
+    ? new Sentinel(db, sentinelChanged, options.sentinelModel)
+    : new Sentinel(db, sentinelChanged);
   const scheduleIncidents = (incidents: Array<{ id: number }>) => {
     for (const incident of incidents) sentinel.schedule(incident.id);
   };
@@ -72,7 +103,7 @@ export async function buildServer() {
   };
 
   superviseDatabase(db);
-  sentinel.schedulePending();
+  if (options.schedulePending !== false) sentinel.schedulePending();
   const watchdog = setInterval(supervise, 30_000);
   watchdog.unref();
   app.addHook('onClose', async () => {
@@ -83,6 +114,11 @@ export async function buildServer() {
 
   app.get('/api/jobs', async () => ({ jobs: listJobCards(db) }));
   app.get('/api/session', async () => ({ token: sessionToken }));
+  app.get('/api/auto-fix', async () => ({
+    enabled: autoFixEnabled,
+    applying: autoFixInFlight.size > 0,
+    policy: 'Low-risk failure patches/configs with at least 95% confidence and a verified skeptic pass. One attempt per incident.'
+  }));
   app.get('/api/remote-status', async () => publicationConfiguration());
   app.get('/api/jobs/:id', async (request, reply) => {
     const { id } = idParamsSchema.parse(request.params);
@@ -151,6 +187,17 @@ export async function buildServer() {
     return reply.code(201).send(result);
   });
 
+  app.post('/api/auto-fix', async (request, reply) => {
+    const { enabled } = autoFixInputSchema.parse(request.body);
+    autoFixEnabled = enabled;
+    broadcast('auto-fix');
+    if (enabled) {
+      const incidents = db.prepare("SELECT id FROM incidents WHERE status = 'proposed'").all() as Array<{ id: number }>;
+      for (const incident of incidents) void maybeAutoFix(incident.id);
+    }
+    return reply.send({ enabled: autoFixEnabled, applying: autoFixInFlight.size > 0 });
+  });
+
   app.post('/api/remote-status/publish', async (_request, reply) => {
     const result = await publishStatus(db);
     return reply.code(201).send(result);
@@ -162,6 +209,26 @@ export async function buildServer() {
     if (!result.closed) sentinel.schedule(id);
     broadcast(result.closed ? 'incident-closed' : 'run');
     return reply.send(result);
+  });
+
+  app.post('/api/incidents/:id/retry-diagnosis', async (request, reply) => {
+    const { id } = idParamsSchema.parse(request.params);
+    const retryable = db.prepare(`
+      SELECT i.status, p.id AS proposal_id, p.model
+      FROM incidents i
+      LEFT JOIN proposals p ON p.id = (
+        SELECT id FROM proposals WHERE incident_id = i.id ORDER BY created_at DESC LIMIT 1
+      )
+      WHERE i.id = ?
+    `).get(id) as { status: string; proposal_id: number | null; model: string | null } | undefined;
+    if (!retryable || !['open', 'proposed'].includes(retryable.status)) throw new ApprovalError(404, 'Open incident not found.');
+    if (retryable.model !== 'error' || retryable.proposal_id === null) {
+      throw new ApprovalError(409, 'Retry is available only after a diagnosis request fails.');
+    }
+    if (!sentinel.schedule(id)) throw new ApprovalError(409, 'Diagnosis is already in progress.');
+    db.prepare('DELETE FROM proposals WHERE id = ?').run(retryable.proposal_id);
+    broadcast('proposal');
+    return reply.code(202).send({ incidentId: id, status: 'diagnosing' });
   });
 
   app.post('/api/incidents/:id/dismiss', async (request, reply) => {

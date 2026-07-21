@@ -1,6 +1,7 @@
 packages:
   - packages/*
   - '!packages/status'
+  - '!packages/demo'
 
 onlyBuiltDependencies:
   - better-sqlite3

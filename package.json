@@ -6,7 +6,8 @@
     "build": "pnpm --filter @crontrol/shared build && pnpm --filter @crontrol/web build && pnpm --filter @crontrol/server build && pnpm --filter crontrol build",
     "build:status": "npm --prefix packages/status run build",
     "dev": "pnpm --filter @crontrol/web dev",
-    "test": "pnpm --filter @crontrol/server test",
+    "onboard": "node scripts/onboard.mjs",
+    "test": "node --test scripts/onboard.test.mjs && pnpm --filter crontrol test && pnpm --filter @crontrol/server test",
     "test:status": "npm --prefix packages/status test",
     "ct": "ct"
   },

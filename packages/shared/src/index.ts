@@ -29,6 +29,7 @@ export const pingParamsSchema = z.object({ name: z.string().trim().min(1).max(12
 export const pingQuerySchema = z.object({ state: z.enum(['start', 'success', 'fail']).optional() });
 export const pingBodySchema = z.union([z.string(), z.record(z.string(), z.unknown()), z.null(), z.undefined()]);
 export const dismissInputSchema = z.object({ reason: z.string().trim().min(1).max(1000) });
+export const autoFixInputSchema = z.object({ enabled: z.boolean() });
 
 export const diagnosisSchema = z.object({
   root_cause: z.string().min(1),
