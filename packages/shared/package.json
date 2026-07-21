@@ -1,0 +1,14 @@
+{
+  "name": "@crontrol/shared",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": "./dist/index.js",
+  "scripts": { "build": "tsc -p tsconfig.json" },
+  "dependencies": {
+    "better-sqlite3": "^12.2.0",
+    "zod": "^4.0.17"
+  },
+  "devDependencies": { "@types/better-sqlite3": "^7.6.13" }
+}

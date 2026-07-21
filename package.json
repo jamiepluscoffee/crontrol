@@ -1,0 +1,17 @@
+{
+  "name": "crontrol-monorepo",
+  "private": true,
+  "packageManager": "pnpm@10.14.0",
+  "scripts": {
+    "build": "pnpm --filter @crontrol/shared build && pnpm --filter @crontrol/web build && pnpm --filter @crontrol/server build && pnpm --filter crontrol build",
+    "dev": "pnpm --filter @crontrol/web dev",
+    "ct": "ct"
+  },
+  "devDependencies": {
+    "crontrol": "workspace:*",
+    "typescript": "^5.9.2"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": ["better-sqlite3", "esbuild"]
+  }
+}
